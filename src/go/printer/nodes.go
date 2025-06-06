@@ -401,7 +401,7 @@ func (p *printer) parameters(fields *ast.FieldList, mode paramMode) {
 // combinesWithName reports whether a name followed by the expression x
 // syntactically combines to another valid (value) expression. For instance
 // using *T for x, "name *T" syntactically appears as the expression x*T.
-// On the other hand, using  P|Q or *P|~Q for x, "name P|Q" or name *P|~Q"
+// On the other hand, using  P|Q or *P|~Q for x, "name P|Q" or "name *P|~Q"
 // cannot be combined into a valid (value) expression.
 func combinesWithName(x ast.Expr) bool {
 	switch x := x.(type) {
@@ -1737,9 +1737,6 @@ func (p *printer) genDecl(d *ast.GenDecl) {
 	p.setPos(d.Pos())
 	p.print(d.Tok, blank)
 
-	defer func(d bool) { p.inDecl = d }(p.inDecl)
-	p.inDecl = true
-
 	if d.Lparen.IsValid() || len(d.Specs) != 1 {
 		// group of parenthesized declarations
 		p.setPos(d.Lparen)
@@ -1924,10 +1921,6 @@ func (p *printer) funcDecl(d *ast.FuncDecl) {
 	p.setComment(d.Doc)
 	p.setPos(d.Pos())
 	p.print(token.FUNC, blank)
-
-	defer func(d bool) { p.inDecl = d }(p.inDecl)
-	p.inDecl = true
-
 	// We have to save startCol only after emitting FUNC; otherwise it can be on a
 	// different line (all whitespace preceding the FUNC is emitted only when the
 	// FUNC is emitted).

@@ -93,6 +93,9 @@ func (f flag) ro() flag {
 	return 0
 }
 
+// typ returns the *abi.Type stored in the Value. This method is fast,
+// but it doesn't always return the correct type for the Value.
+// See abiType and Type, which do return the correct type.
 func (v Value) typ() *abi.Type {
 	// Types are either static (for compiler-created types) or
 	// heap-allocated but always reachable (for reflection-created
@@ -118,8 +121,8 @@ func (v Value) pointer() unsafe.Pointer {
 // packEface converts v to the empty interface.
 func packEface(v Value) any {
 	t := v.typ()
-	var i any
-	e := (*abi.EmptyInterface)(unsafe.Pointer(&i))
+	// Declare e as a struct (and not pointer to struct) to help escape analysis.
+	e := abi.EmptyInterface{}
 	// First, fill in the data portion of the interface.
 	switch {
 	case t.IfaceIndir():
@@ -142,12 +145,9 @@ func packEface(v Value) any {
 		// Value is direct, and so is the interface.
 		e.Data = v.ptr
 	}
-	// Now, fill in the type portion. We're very careful here not
-	// to have any operation between the e.word and e.typ assignments
-	// that would let the garbage collector observe the partially-built
-	// interface value.
+	// Now, fill in the type portion.
 	e.Type = t
-	return i
+	return *(*any)(unsafe.Pointer(&e))
 }
 
 // unpackEface converts the empty interface i to a Value.
@@ -1216,15 +1216,7 @@ func (v Value) Elem() Value {
 	k := v.kind()
 	switch k {
 	case Interface:
-		var eface any
-		if v.typ().NumMethod() == 0 {
-			eface = *(*any)(v.ptr)
-		} else {
-			eface = (any)(*(*interface {
-				M()
-			})(v.ptr))
-		}
-		x := unpackEface(eface)
+		x := unpackEface(packIfaceValueIntoEmptyIface(v))
 		if x.flag != 0 {
 			x.flag |= v.flag.ro()
 		}
@@ -1497,17 +1489,89 @@ func valueInterface(v Value, safe bool) any {
 
 	if v.kind() == Interface {
 		// Special case: return the element inside the interface.
-		// Empty interface has one layout, all interfaces with
-		// methods have a second layout.
-		if v.NumMethod() == 0 {
-			return *(*any)(v.ptr)
-		}
-		return *(*interface {
-			M()
-		})(v.ptr)
+		return packIfaceValueIntoEmptyIface(v)
 	}
 
 	return packEface(v)
+}
+
+// TypeAssert is semantically equivalent to:
+//
+//	v2, ok := v.Interface().(T)
+func TypeAssert[T any](v Value) (T, bool) {
+	if v.flag == 0 {
+		panic(&ValueError{"reflect.TypeAssert", Invalid})
+	}
+	if v.flag&flagRO != 0 {
+		// Do not allow access to unexported values via TypeAssert,
+		// because they might be pointers that should not be
+		// writable or methods or function that should not be callable.
+		panic("reflect.TypeAssert: cannot return value obtained from unexported field or method")
+	}
+
+	if v.flag&flagMethod != 0 {
+		v = makeMethodValue("TypeAssert", v)
+	}
+
+	typ := abi.TypeFor[T]()
+	if typ != v.typ() {
+		// We can't just return false here:
+		//
+		//	var zero T
+		//	return zero, false
+		//
+		// since this function should work in the same manner as v.Interface().(T) does.
+		// Thus we have to handle two cases specially.
+
+		// Return the element inside the interface.
+		//
+		// T is a concrete type and v is an interface. For example:
+		//
+		// var v any = int(1)
+		// val := ValueOf(&v).Elem()
+		// TypeAssert[int](val) == val.Interface().(int)
+		//
+		// T is a interface and v is an interface, but the iface types are different. For example:
+		//
+		// var v any = &someError{}
+		// val := ValueOf(&v).Elem()
+		// TypeAssert[error](val) == val.Interface().(error)
+		if v.kind() == Interface {
+			v, ok := packIfaceValueIntoEmptyIface(v).(T)
+			return v, ok
+		}
+
+		// T is an interface, v is a concrete type. For example:
+		//
+		// TypeAssert[any](ValueOf(1)) == ValueOf(1).Interface().(any)
+		// TypeAssert[error](ValueOf(&someError{})) == ValueOf(&someError{}).Interface().(error)
+		if typ.Kind() == abi.Interface {
+			v, ok := packEface(v).(T)
+			return v, ok
+		}
+
+		var zero T
+		return zero, false
+	}
+
+	if v.flag&flagIndir == 0 {
+		return *(*T)(unsafe.Pointer(&v.ptr)), true
+	}
+	return *(*T)(v.ptr), true
+}
+
+// packIfaceValueIntoEmptyIface converts an interface Value into an empty interface.
+//
+// Precondition: v.kind() == Interface
+func packIfaceValueIntoEmptyIface(v Value) any {
+	// Empty interface has one layout, all interfaces with
+	// methods have a second layout.
+	if v.NumMethod() == 0 {
+		return *(*any)(v.ptr)
+	}
+	return *(*interface {
+		M()
+	})(v.ptr)
 }
 
 // InterfaceData returns a pair of unspecified uintptr values.
@@ -1585,6 +1649,9 @@ func (v Value) IsZero() bool {
 		if v.flag&flagIndir == 0 {
 			return v.ptr == nil
 		}
+		if v.ptr == unsafe.Pointer(&zeroVal[0]) {
+			return true
+		}
 		typ := (*abi.ArrayType)(unsafe.Pointer(v.typ()))
 		// If the type is comparable, then compare directly with zero.
 		if typ.Equal != nil && typ.Size() <= abi.ZeroValSize {
@@ -1612,6 +1679,9 @@ func (v Value) IsZero() bool {
 	case Struct:
 		if v.flag&flagIndir == 0 {
 			return v.ptr == nil
+		}
+		if v.ptr == unsafe.Pointer(&zeroVal[0]) {
+			return true
 		}
 		typ := (*abi.StructType)(unsafe.Pointer(v.typ()))
 		// If the type is comparable, then compare directly with zero.
@@ -1796,6 +1866,9 @@ func copyVal(typ *abi.Type, fl flag, ptr unsafe.Pointer) Value {
 // The arguments to a Call on the returned function should not include
 // a receiver; the returned function will always use v as the receiver.
 // Method panics if i is out of range or if v is a nil interface value.
+//
+// Calling this method will force the linker to retain all exported methods in all packages.
+// This may make the executable binary larger but will not affect execution time.
 func (v Value) Method(i int) Value {
 	if v.typ() == nil {
 		panic(&ValueError{"reflect.Value.Method", Invalid})
@@ -1832,6 +1905,10 @@ func (v Value) NumMethod() int {
 // The arguments to a Call on the returned function should not include
 // a receiver; the returned function will always use v as the receiver.
 // It returns the zero Value if no method was found.
+//
+// Calling this method will cause the linker to retain all methods with this name in all packages.
+// If the linker can't determine the name, it will retain all exported methods.
+// This may make the executable binary larger but will not affect execution time.
 func (v Value) MethodByName(name string) Value {
 	if v.typ() == nil {
 		panic(&ValueError{"reflect.Value.MethodByName", Invalid})
@@ -2072,7 +2149,8 @@ func (v Value) SetBool(x bool) {
 }
 
 // SetBytes sets v's underlying value.
-// It panics if v's underlying value is not a slice of bytes.
+// It panics if v's underlying value is not a slice of bytes
+// or if [Value.CanSet] returns false.
 func (v Value) SetBytes(x []byte) {
 	v.mustBeAssignable()
 	v.mustBe(Slice)
@@ -2083,7 +2161,8 @@ func (v Value) SetBytes(x []byte) {
 }
 
 // setRunes sets v's underlying value.
-// It panics if v's underlying value is not a slice of runes (int32s).
+// It panics if v's underlying value is not a slice of runes (int32s)
+// or if [Value.CanSet] returns false.
 func (v Value) setRunes(x []rune) {
 	v.mustBeAssignable()
 	v.mustBe(Slice)
@@ -2094,7 +2173,8 @@ func (v Value) setRunes(x []rune) {
 }
 
 // SetComplex sets v's underlying value to x.
-// It panics if v's Kind is not [Complex64] or [Complex128], or if [Value.CanSet] returns false.
+// It panics if v's Kind is not [Complex64] or [Complex128],
+// or if [Value.CanSet] returns false.
 func (v Value) SetComplex(x complex128) {
 	v.mustBeAssignable()
 	switch k := v.kind(); k {
@@ -2108,7 +2188,8 @@ func (v Value) SetComplex(x complex128) {
 }
 
 // SetFloat sets v's underlying value to x.
-// It panics if v's Kind is not [Float32] or [Float64], or if [Value.CanSet] returns false.
+// It panics if v's Kind is not [Float32] or [Float64],
+// or if [Value.CanSet] returns false.
 func (v Value) SetFloat(x float64) {
 	v.mustBeAssignable()
 	switch k := v.kind(); k {
@@ -2122,7 +2203,8 @@ func (v Value) SetFloat(x float64) {
 }
 
 // SetInt sets v's underlying value to x.
-// It panics if v's Kind is not [Int], [Int8], [Int16], [Int32], or [Int64], or if [Value.CanSet] returns false.
+// It panics if v's Kind is not [Int], [Int8], [Int16], [Int32], or [Int64],
+// or if [Value.CanSet] returns false.
 func (v Value) SetInt(x int64) {
 	v.mustBeAssignable()
 	switch k := v.kind(); k {
@@ -2142,8 +2224,9 @@ func (v Value) SetInt(x int64) {
 }
 
 // SetLen sets v's length to n.
-// It panics if v's Kind is not [Slice] or if n is negative or
-// greater than the capacity of the slice.
+// It panics if v's Kind is not [Slice], or if n is negative or
+// greater than the capacity of the slice,
+// or if [Value.CanSet] returns false.
 func (v Value) SetLen(n int) {
 	v.mustBeAssignable()
 	v.mustBe(Slice)
@@ -2155,8 +2238,9 @@ func (v Value) SetLen(n int) {
 }
 
 // SetCap sets v's capacity to n.
-// It panics if v's Kind is not [Slice] or if n is smaller than the length or
-// greater than the capacity of the slice.
+// It panics if v's Kind is not [Slice], or if n is smaller than the length or
+// greater than the capacity of the slice,
+// or if [Value.CanSet] returns false.
 func (v Value) SetCap(n int) {
 	v.mustBeAssignable()
 	v.mustBe(Slice)
@@ -2168,7 +2252,8 @@ func (v Value) SetCap(n int) {
 }
 
 // SetUint sets v's underlying value to x.
-// It panics if v's Kind is not [Uint], [Uintptr], [Uint8], [Uint16], [Uint32], or [Uint64], or if [Value.CanSet] returns false.
+// It panics if v's Kind is not [Uint], [Uintptr], [Uint8], [Uint16], [Uint32], or [Uint64],
+// or if [Value.CanSet] returns false.
 func (v Value) SetUint(x uint64) {
 	v.mustBeAssignable()
 	switch k := v.kind(); k {
@@ -2190,7 +2275,8 @@ func (v Value) SetUint(x uint64) {
 }
 
 // SetPointer sets the [unsafe.Pointer] value v to x.
-// It panics if v's Kind is not [UnsafePointer].
+// It panics if v's Kind is not [UnsafePointer]
+// or if [Value.CanSet] returns false.
 func (v Value) SetPointer(x unsafe.Pointer) {
 	v.mustBeAssignable()
 	v.mustBe(UnsafePointer)
@@ -2371,14 +2457,26 @@ func (v Value) Type() Type {
 	return v.typeSlow()
 }
 
+//go:noinline
 func (v Value) typeSlow() Type {
+	return toRType(v.abiTypeSlow())
+}
+
+func (v Value) abiType() *abi.Type {
+	if v.flag != 0 && v.flag&flagMethod == 0 {
+		return v.typ()
+	}
+	return v.abiTypeSlow()
+}
+
+func (v Value) abiTypeSlow() *abi.Type {
 	if v.flag == 0 {
 		panic(&ValueError{"reflect.Value.Type", Invalid})
 	}
 
 	typ := v.typ()
 	if v.flag&flagMethod == 0 {
-		return toRType(v.typ())
+		return v.typ()
 	}
 
 	// Method value.
@@ -2391,7 +2489,7 @@ func (v Value) typeSlow() Type {
 			panic("reflect: internal error: invalid method index")
 		}
 		m := &tt.Methods[i]
-		return toRType(typeOffFor(typ, m.Typ))
+		return typeOffFor(typ, m.Typ)
 	}
 	// Method on concrete type.
 	ms := typ.ExportedMethods()
@@ -2399,7 +2497,7 @@ func (v Value) typeSlow() Type {
 		panic("reflect: internal error: invalid method index")
 	}
 	m := ms[i]
-	return toRType(typeOffFor(typ, m.Mtyp))
+	return typeOffFor(typ, m.Mtyp)
 }
 
 // CanUint reports whether [Value.Uint] can be used without panicking.
@@ -2558,8 +2656,8 @@ func arrayAt(p unsafe.Pointer, i int, eltSize uintptr, whySafe string) unsafe.Po
 // another n elements. After Grow(n), at least n elements can be appended
 // to the slice without another allocation.
 //
-// It panics if v's Kind is not a [Slice] or if n is negative or too large to
-// allocate the memory.
+// It panics if v's Kind is not a [Slice], or if n is negative or too large to
+// allocate the memory, or if [Value.CanSet] returns false.
 func (v Value) Grow(n int) {
 	v.mustBeAssignable()
 	v.mustBe(Slice)
@@ -2647,6 +2745,7 @@ func AppendSlice(s, t Value) Value {
 // It returns the number of elements copied.
 // Dst and src each must have kind [Slice] or [Array], and
 // dst and src must have the same element type.
+// It dst is an [Array], it panics if [Value.CanSet] returns false.
 //
 // As a special case, src can have kind [String] if the element type of dst is kind [Uint8].
 func Copy(dst, src Value) int {
@@ -3592,18 +3691,6 @@ func mapdelete(t *abi.Type, m unsafe.Pointer, key unsafe.Pointer)
 
 //go:noescape
 func mapdelete_faststr(t *abi.Type, m unsafe.Pointer, key string)
-
-//go:noescape
-func mapiterinit(t *abi.Type, m unsafe.Pointer, it *hiter)
-
-//go:noescape
-func mapiterkey(it *hiter) (key unsafe.Pointer)
-
-//go:noescape
-func mapiterelem(it *hiter) (elem unsafe.Pointer)
-
-//go:noescape
-func mapiternext(it *hiter)
 
 //go:noescape
 func maplen(m unsafe.Pointer) int

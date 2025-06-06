@@ -13,16 +13,6 @@ import (
 )
 
 // Validate the constants redefined from unicode.
-func init() {
-	if MaxRune != unicode.MaxRune {
-		panic("utf8.MaxRune is wrong")
-	}
-	if RuneError != unicode.ReplacementChar {
-		panic("utf8.RuneError is wrong")
-	}
-}
-
-// Validate the constants redefined from unicode.
 func TestConstants(t *testing.T) {
 	if MaxRune != unicode.MaxRune {
 		t.Errorf("utf8.MaxRune is wrong: %x should be %x", MaxRune, unicode.MaxRune)
@@ -435,6 +425,15 @@ func TestRuneCount(t *testing.T) {
 		if out := RuneCount([]byte(tt.in)); out != tt.out {
 			t.Errorf("RuneCount(%q) = %d, want %d", tt.in, out, tt.out)
 		}
+	}
+}
+
+func TestRuneCountNonASCIIAllocation(t *testing.T) {
+	if n := testing.AllocsPerRun(10, func() {
+		s := []byte("日本語日本語日本語日")
+		_ = RuneCount(s)
+	}); n > 0 {
+		t.Errorf("unexpected RuneCount allocation, got %v, want 0", n)
 	}
 }
 

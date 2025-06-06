@@ -67,7 +67,7 @@ var (
 
 	// dirs are the directories to look for *.go files in.
 	// TODO(bradfitz): just use all directories?
-	dirs = []string{".", "ken", "chan", "interface", "syntax", "dwarf", "fixedbugs", "codegen", "runtime", "abi", "typeparam", "typeparam/mdempsky", "arenas"}
+	dirs = []string{".", "ken", "chan", "interface", "internal/runtime/sys", "syntax", "dwarf", "fixedbugs", "codegen", "abi", "typeparam", "typeparam/mdempsky", "arenas"}
 )
 
 // Test is the main entrypoint that runs tests in the GOROOT/test directory.
@@ -215,8 +215,11 @@ var stdlibImportcfg = sync.OnceValue(func() string {
 	cmd := exec.Command(goTool, "list", "-export", "-f", "{{if .Export}}packagefile {{.ImportPath}}={{.Export}}{{end}}", "std")
 	cmd.Env = append(os.Environ(), "GOENV=off", "GOFLAGS=")
 	output, err := cmd.Output()
+	if err, ok := err.(*exec.ExitError); ok && len(err.Stderr) != 0 {
+		log.Fatalf("'go list' failed: %v: %s", err, err.Stderr)
+	}
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("'go list' failed: %v", err)
 	}
 	return string(output)
 })
@@ -234,7 +237,7 @@ func linkFile(runcmd runCmd, goname string, importcfg string, ldflags []string) 
 	if importcfg == "" {
 		importcfg = stdlibImportcfgFile()
 	}
-	pfile := strings.Replace(goname, ".go", ".o", -1)
+	pfile := strings.ReplaceAll(goname, ".go", ".o")
 	cmd := []string{goTool, "tool", "link", "-w", "-o", "a.exe", "-importcfg=" + importcfg}
 	if *linkshared {
 		cmd = append(cmd, "-linkshared", "-installsuffix=dynlink")
@@ -292,7 +295,7 @@ func (t test) goFileName() string {
 }
 
 func (t test) goDirName() string {
-	return filepath.Join(t.dir, strings.Replace(t.goFile, ".go", ".dir", -1))
+	return filepath.Join(t.dir, strings.ReplaceAll(t.goFile, ".go", ".dir"))
 }
 
 // goDirFiles returns .go files in dir.
@@ -1142,7 +1145,7 @@ func (t test) checkExpectedOutput(gotBytes []byte) error {
 	} else if err != nil {
 		return err
 	}
-	got = strings.Replace(got, "\r\n", "\n", -1)
+	got = strings.ReplaceAll(got, "\r\n", "\n")
 	if got != string(b) {
 		if err == nil {
 			return fmt.Errorf("output does not match expected in %s. Instead saw\n%s", filename, got)
@@ -1240,6 +1243,24 @@ func (t test) errorCheck(outStr string, wantAuto bool, fullshort ...string) (err
 	}
 
 	if len(out) > 0 {
+		// If a test uses -m and instantiates an imported generic function,
+		// the errors will include messages for the instantiated function
+		// with locations in the other package. Filter those out.
+		localOut := make([]string, 0, len(out))
+	outLoop:
+		for _, errLine := range out {
+			for j := 0; j < len(fullshort); j += 2 {
+				full, short := fullshort[j], fullshort[j+1]
+				if strings.HasPrefix(errLine, full+":") || strings.HasPrefix(errLine, short+":") {
+					localOut = append(localOut, errLine)
+					continue outLoop
+				}
+			}
+		}
+		out = localOut
+	}
+
+	if len(out) > 0 {
 		errs = append(errs, fmt.Errorf("Unmatched Errors:"))
 		for _, errLine := range out {
 			errs = append(errs, fmt.Errorf("%s", errLine))
@@ -1276,9 +1297,16 @@ func (test) updateErrors(out, file string) {
 	// Parse new errors.
 	errors := make(map[int]map[string]bool)
 	tmpRe := regexp.MustCompile(`autotmp_\d+`)
+	fileRe := regexp.MustCompile(`(\.go):\d+:`)
 	for _, errStr := range splitOutput(out, false) {
-		errFile, rest, ok := strings.Cut(errStr, ":")
-		if !ok || errFile != file {
+		m := fileRe.FindStringSubmatchIndex(errStr)
+		if len(m) != 4 {
+			continue
+		}
+		// The end of the file is the end of the first and only submatch.
+		errFile := errStr[:m[3]]
+		rest := errStr[m[3]+1:]
+		if errFile != file {
 			continue
 		}
 		lineStr, msg, ok := strings.Cut(rest, ":")
@@ -1290,12 +1318,12 @@ func (test) updateErrors(out, file string) {
 		if err != nil || line < 0 || line >= len(lines) {
 			continue
 		}
-		msg = strings.Replace(msg, file, base, -1) // normalize file mentions in error itself
+		msg = strings.ReplaceAll(msg, file, base) // normalize file mentions in error itself
 		msg = strings.TrimLeft(msg, " \t")
 		for _, r := range []string{`\`, `*`, `+`, `?`, `[`, `]`, `(`, `)`} {
-			msg = strings.Replace(msg, r, `\`+r, -1)
+			msg = strings.ReplaceAll(msg, r, `\`+r)
 		}
-		msg = strings.Replace(msg, `"`, `.`, -1)
+		msg = strings.ReplaceAll(msg, `"`, `.`)
 		msg = tmpRe.ReplaceAllLiteralString(msg, `autotmp_[0-9]+`)
 		if errors[line] == nil {
 			errors[line] = make(map[string]bool)
@@ -1479,7 +1507,7 @@ var (
 		"ppc64x":  {}, // A pseudo-arch representing both ppc64 and ppc64le
 		"s390x":   {},
 		"wasm":    {},
-		"riscv64": {"GORISCV64", "rva20u64", "rva22u64"},
+		"riscv64": {"GORISCV64", "rva20u64", "rva22u64", "rva23u64"},
 	}
 )
 

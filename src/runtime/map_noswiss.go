@@ -59,7 +59,9 @@ import (
 	"internal/abi"
 	"internal/goarch"
 	"internal/runtime/atomic"
+	"internal/runtime/maps"
 	"internal/runtime/math"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -122,6 +124,7 @@ type hmap struct {
 	buckets    unsafe.Pointer // array of 2^B Buckets. may be nil if count==0.
 	oldbuckets unsafe.Pointer // previous bucket array of half the size, non-nil only when growing
 	nevacuate  uintptr        // progress counter for evacuation (buckets less than this have been evacuated)
+	clearSeq   uint64
 
 	extra *mapextra // optional fields
 }
@@ -175,6 +178,7 @@ type hiter struct {
 	i           uint8
 	bucket      uintptr
 	checkBucket uintptr
+	clearSeq    uint64
 }
 
 // bucketShift returns 1<<b, optimized for code generation.
@@ -411,7 +415,7 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 // hold onto it for very long.
 func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 	if raceenabled && h != nil {
-		callerpc := getcallerpc()
+		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(mapaccess1)
 		racereadpc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.Key, key, callerpc, pc)
@@ -423,7 +427,7 @@ func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 		asanread(key, t.Key.Size_)
 	}
 	if h == nil || h.count == 0 {
-		if err := mapKeyError(t, key); err != nil {
+		if err := maps.OldMapKeyError(t, key); err != nil {
 			panic(err) // see issue 23734
 		}
 		return unsafe.Pointer(&zeroVal[0])
@@ -481,7 +485,7 @@ bucketloop:
 //go:linkname mapaccess2
 func mapaccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) {
 	if raceenabled && h != nil {
-		callerpc := getcallerpc()
+		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(mapaccess2)
 		racereadpc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.Key, key, callerpc, pc)
@@ -493,7 +497,7 @@ func mapaccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) 
 		asanread(key, t.Key.Size_)
 	}
 	if h == nil || h.count == 0 {
-		if err := mapKeyError(t, key); err != nil {
+		if err := maps.OldMapKeyError(t, key); err != nil {
 			panic(err) // see issue 23734
 		}
 		return unsafe.Pointer(&zeroVal[0]), false
@@ -619,7 +623,7 @@ func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 		panic(plainError("assignment to entry in nil map"))
 	}
 	if raceenabled {
-		callerpc := getcallerpc()
+		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(mapassign)
 		racewritepc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.Key, key, callerpc, pc)
@@ -742,7 +746,7 @@ done:
 //go:linkname mapdelete
 func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
 	if raceenabled && h != nil {
-		callerpc := getcallerpc()
+		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(mapdelete)
 		racewritepc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.Key, key, callerpc, pc)
@@ -754,7 +758,7 @@ func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
 		asanread(key, t.Key.Size_)
 	}
 	if h == nil || h.count == 0 {
-		if err := mapKeyError(t, key); err != nil {
+		if err := maps.OldMapKeyError(t, key); err != nil {
 			panic(err) // see issue 23734
 		}
 		return
@@ -877,7 +881,7 @@ search:
 //go:linkname mapiterinit
 func mapiterinit(t *maptype, h *hmap, it *hiter) {
 	if raceenabled && h != nil {
-		callerpc := getcallerpc()
+		callerpc := sys.GetCallerPC()
 		racereadpc(unsafe.Pointer(h), callerpc, abi.FuncPCABIInternal(mapiterinit))
 	}
 
@@ -886,10 +890,11 @@ func mapiterinit(t *maptype, h *hmap, it *hiter) {
 		return
 	}
 
-	if unsafe.Sizeof(hiter{})/goarch.PtrSize != 12 {
+	if unsafe.Sizeof(hiter{}) != 8+12*goarch.PtrSize {
 		throw("hash_iter size incorrect") // see cmd/compile/internal/reflectdata/reflect.go
 	}
 	it.h = h
+	it.clearSeq = h.clearSeq
 
 	// grab snapshot of bucket state
 	it.B = h.B
@@ -937,7 +942,7 @@ func mapiterinit(t *maptype, h *hmap, it *hiter) {
 func mapiternext(it *hiter) {
 	h := it.h
 	if raceenabled {
-		callerpc := getcallerpc()
+		callerpc := sys.GetCallerPC()
 		racereadpc(unsafe.Pointer(h), callerpc, abi.FuncPCABIInternal(mapiternext))
 	}
 	if h.flags&hashWriting != 0 {
@@ -1021,8 +1026,9 @@ next:
 				}
 			}
 		}
-		if (b.tophash[offi] != evacuatedX && b.tophash[offi] != evacuatedY) ||
-			!(t.ReflexiveKey() || t.Key.Equal(k, k)) {
+		if it.clearSeq == h.clearSeq &&
+			((b.tophash[offi] != evacuatedX && b.tophash[offi] != evacuatedY) ||
+				!(t.ReflexiveKey() || t.Key.Equal(k, k))) {
 			// This is the golden data, we can return it.
 			// OR
 			// key!=key, so the entry can't be deleted or updated, so we can just return it.
@@ -1064,7 +1070,7 @@ next:
 // It is called by the compiler.
 func mapclear(t *maptype, h *hmap) {
 	if raceenabled && h != nil {
-		callerpc := getcallerpc()
+		callerpc := sys.GetCallerPC()
 		pc := abi.FuncPCABIInternal(mapclear)
 		racewritepc(unsafe.Pointer(h), callerpc, pc)
 	}
@@ -1078,28 +1084,12 @@ func mapclear(t *maptype, h *hmap) {
 	}
 
 	h.flags ^= hashWriting
-
-	// Mark buckets empty, so existing iterators can be terminated, see issue #59411.
-	markBucketsEmpty := func(bucket unsafe.Pointer, mask uintptr) {
-		for i := uintptr(0); i <= mask; i++ {
-			b := (*bmap)(add(bucket, i*uintptr(t.BucketSize)))
-			for ; b != nil; b = b.overflow(t) {
-				for i := uintptr(0); i < abi.OldMapBucketCount; i++ {
-					b.tophash[i] = emptyRest
-				}
-			}
-		}
-	}
-	markBucketsEmpty(h.buckets, bucketMask(h.B))
-	if oldBuckets := h.oldbuckets; oldBuckets != nil {
-		markBucketsEmpty(oldBuckets, h.oldbucketmask())
-	}
-
 	h.flags &^= sameSizeGrow
 	h.oldbuckets = nil
 	h.nevacuate = 0
 	h.noverflow = 0
 	h.count = 0
+	h.clearSeq++
 
 	// Reset the hash seed to make it more difficult for attackers to
 	// repeatedly trigger hash collisions. See issue 25237.
@@ -1527,7 +1517,7 @@ func reflect_mapiternext(it *hiter) {
 	mapiternext(it)
 }
 
-// reflect_mapiterkey is for package reflect,
+// reflect_mapiterkey was for package reflect,
 // but widely used packages access it using linkname.
 // Notable members of the hall of shame include:
 //   - github.com/goccy/go-json
@@ -1541,7 +1531,7 @@ func reflect_mapiterkey(it *hiter) unsafe.Pointer {
 	return it.key
 }
 
-// reflect_mapiterelem is for package reflect,
+// reflect_mapiterelem was for package reflect,
 // but widely used packages access it using linkname.
 // Notable members of the hall of shame include:
 //   - github.com/goccy/go-json
@@ -1570,7 +1560,7 @@ func reflect_maplen(h *hmap) int {
 		return 0
 	}
 	if raceenabled {
-		callerpc := getcallerpc()
+		callerpc := sys.GetCallerPC()
 		racereadpc(unsafe.Pointer(h), callerpc, abi.FuncPCABIInternal(reflect_maplen))
 	}
 	return h.count
@@ -1587,7 +1577,7 @@ func reflectlite_maplen(h *hmap) int {
 		return 0
 	}
 	if raceenabled {
-		callerpc := getcallerpc()
+		callerpc := sys.GetCallerPC()
 		racereadpc(unsafe.Pointer(h), callerpc, abi.FuncPCABIInternal(reflect_maplen))
 	}
 	return h.count

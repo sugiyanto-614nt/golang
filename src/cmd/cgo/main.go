@@ -18,6 +18,7 @@ import (
 	"go/token"
 	"internal/buildcfg"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -82,7 +83,7 @@ func (f *File) offset(p token.Pos) int {
 }
 
 func nameKeys(m map[string]*Name) []string {
-	var ks []string
+	ks := make([]string, 0, len(m))
 	for k := range m {
 		ks = append(ks, k)
 	}
@@ -389,7 +390,7 @@ func main() {
 	// We already put _cgo_ at the beginning, so the main
 	// concern is other cgo wrappers for the same functions.
 	// Use the beginning of the 16 bytes hash of the input to disambiguate.
-	h := hash.New16()
+	h := hash.New32()
 	io.WriteString(h, *importPath)
 	var once sync.Once
 	var wg sync.WaitGroup
@@ -598,12 +599,8 @@ func (p *Package) Record(f *File) {
 	}
 
 	// merge nocallback & noescape
-	for k, v := range f.NoCallbacks {
-		p.noCallbacks[k] = v
-	}
-	for k, v := range f.NoEscapes {
-		p.noEscapes[k] = v
-	}
+	maps.Copy(p.noCallbacks, f.NoCallbacks)
+	maps.Copy(p.noEscapes, f.NoEscapes)
 
 	if f.ExpFunc != nil {
 		p.ExpFunc = append(p.ExpFunc, f.ExpFunc...)
