@@ -36,48 +36,17 @@ TEXT _rt0_386_lib(SB),NOSPLIT,$0
 	MOVL	12(BP), AX
 	MOVL	AX, _rt0_386_lib_argv<>(SB)
 
-	// Synchronous initialization.
-	CALL	runtime·libpreinit(SB)
+	CALL	runtime·libInit(SB)
 
-	SUBL	$8, SP
-
-	// Create a new thread to do the runtime initialization.
-	MOVL	_cgo_sys_thread_create(SB), AX
-	TESTL	AX, AX
-	JZ	nocgo
-
-	// Align stack to call C function.
-	// We moved SP to BP above, but BP was clobbered by the libpreinit call.
-	MOVL	SP, BP
-	ANDL	$~15, SP
-
-	MOVL	$_rt0_386_lib_go(SB), BX
-	MOVL	BX, 0(SP)
-	MOVL	$0, 4(SP)
-
-	CALL	AX
-
-	MOVL	BP, SP
-
-	JMP	restore
-
-nocgo:
-	MOVL	$0x800000, 0(SP)                    // stacksize = 8192KB
-	MOVL	$_rt0_386_lib_go(SB), AX
-	MOVL	AX, 4(SP)                           // fn
-	CALL	runtime·newosproc0(SB)
-
-restore:
-	ADDL	$8, SP
 	POPL	DI
 	POPL	SI
 	POPL	BX
 	POPL	BP
 	RET
 
-// _rt0_386_lib_go initializes the Go runtime.
+// rt0_lib_go initializes the Go runtime.
 // This is started in a separate thread by _rt0_386_lib.
-TEXT _rt0_386_lib_go(SB),NOSPLIT,$8
+TEXT runtime·rt0_lib_go<ABIInternal>(SB),NOSPLIT,$8
 	MOVL	_rt0_386_lib_argc<>(SB), AX
 	MOVL	AX, 0(SP)
 	MOVL	_rt0_386_lib_argv<>(SB), AX
@@ -597,12 +566,15 @@ CALLFN(·call268435456, 268435456)
 CALLFN(·call536870912, 536870912)
 CALLFN(·call1073741824, 1073741824)
 
-TEXT runtime·procyield(SB),NOSPLIT,$0-0
+TEXT runtime·procyieldAsm(SB),NOSPLIT,$0-0
 	MOVL	cycles+0(FP), AX
+	TESTL	AX, AX
+	JZ	done
 again:
 	PAUSE
 	SUBL	$1, AX
 	JNZ	again
+done:
 	RET
 
 TEXT ·publicationBarrier(SB),NOSPLIT,$0-0
@@ -662,6 +634,13 @@ TEXT ·asmcgocall(SB),NOSPLIT,$0-12
 	// We get called to create new OS threads too, and those
 	// come in on the m->g0 stack already. Or we might already
 	// be on the m->gsignal stack.
+#ifdef GOOS_windows
+	// On Windows, get_tls might return garbage if the thread
+	// has never called into Go, so check tls_g directly.
+	MOVL	runtime·tls_g(SB), CX
+	CMPL	CX, $0
+	JEQ	nosave
+#endif
 	get_tls(CX)
 	MOVL	g(CX), DI
 	CMPL	DI, $0
@@ -738,7 +717,7 @@ loadg:
 #ifdef GOOS_windows
 	MOVL	$0, BP
 	CMPL	CX, $0
-	JEQ	2(PC) // TODO
+	JEQ	needm
 #endif
 	MOVL	g(CX), BP
 	CMPL	BP, $0
@@ -951,7 +930,7 @@ TEXT runtime·memhash(SB),NOSPLIT,$0-16
 	MOVL	p+0(FP), AX	// ptr to data
 	MOVL	s+8(FP), BX	// size
 	LEAL	ret+12(FP), DX
-	JMP	aeshashbody<>(SB)
+	JMP	runtime·aeshashbody<>(SB)
 noaes:
 	JMP	runtime·memhashFallback(SB)
 
@@ -962,14 +941,14 @@ TEXT runtime·strhash(SB),NOSPLIT,$0-12
 	MOVL	4(AX), BX	// length of string
 	MOVL	(AX), AX	// string data
 	LEAL	ret+8(FP), DX
-	JMP	aeshashbody<>(SB)
+	JMP	runtime·aeshashbody<>(SB)
 noaes:
 	JMP	runtime·strhashFallback(SB)
 
 // AX: data
 // BX: length
 // DX: address to put return value
-TEXT aeshashbody<>(SB),NOSPLIT,$0-0
+TEXT runtime·aeshashbody<>(SB),NOSPLIT,$0-0
 	MOVL	h+4(FP), X0	            // 32 bits of per-table hash seed
 	PINSRW	$4, BX, X0	            // 16 bits of length
 	PSHUFHW	$0, X0, X0	            // replace size with its low 2 bytes repeated 4 times
@@ -1509,161 +1488,47 @@ TEXT runtime·gcWriteBarrier8<ABIInternal>(SB),NOSPLIT,$0
 	MOVL	$32, DI
 	JMP	gcWriteBarrier<>(SB)
 
-// Note: these functions use a special calling convention to save generated code space.
-// Arguments are passed in registers, but the space for those arguments are allocated
-// in the caller's stack frame. These stubs write the args into that stack space and
-// then tail call to the corresponding runtime handler.
-// The tail call makes these stubs disappear in backtraces.
-TEXT runtime·panicIndex(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicIndex(SB)
-TEXT runtime·panicIndexU(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicIndexU(SB)
-TEXT runtime·panicSliceAlen(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSliceAlen(SB)
-TEXT runtime·panicSliceAlenU(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSliceAlenU(SB)
-TEXT runtime·panicSliceAcap(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSliceAcap(SB)
-TEXT runtime·panicSliceAcapU(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSliceAcapU(SB)
-TEXT runtime·panicSliceB(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicSliceB(SB)
-TEXT runtime·panicSliceBU(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicSliceBU(SB)
-TEXT runtime·panicSlice3Alen(SB),NOSPLIT,$0-8
-	MOVL	DX, x+0(FP)
-	MOVL	BX, y+4(FP)
-	JMP	runtime·goPanicSlice3Alen(SB)
-TEXT runtime·panicSlice3AlenU(SB),NOSPLIT,$0-8
-	MOVL	DX, x+0(FP)
-	MOVL	BX, y+4(FP)
-	JMP	runtime·goPanicSlice3AlenU(SB)
-TEXT runtime·panicSlice3Acap(SB),NOSPLIT,$0-8
-	MOVL	DX, x+0(FP)
-	MOVL	BX, y+4(FP)
-	JMP	runtime·goPanicSlice3Acap(SB)
-TEXT runtime·panicSlice3AcapU(SB),NOSPLIT,$0-8
-	MOVL	DX, x+0(FP)
-	MOVL	BX, y+4(FP)
-	JMP	runtime·goPanicSlice3AcapU(SB)
-TEXT runtime·panicSlice3B(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSlice3B(SB)
-TEXT runtime·panicSlice3BU(SB),NOSPLIT,$0-8
-	MOVL	CX, x+0(FP)
-	MOVL	DX, y+4(FP)
-	JMP	runtime·goPanicSlice3BU(SB)
-TEXT runtime·panicSlice3C(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicSlice3C(SB)
-TEXT runtime·panicSlice3CU(SB),NOSPLIT,$0-8
-	MOVL	AX, x+0(FP)
-	MOVL	CX, y+4(FP)
-	JMP	runtime·goPanicSlice3CU(SB)
-TEXT runtime·panicSliceConvert(SB),NOSPLIT,$0-8
-	MOVL	DX, x+0(FP)
-	MOVL	BX, y+4(FP)
-	JMP	runtime·goPanicSliceConvert(SB)
+TEXT runtime·panicBounds<ABIInternal>(SB),NOSPLIT,$40-0
+	NO_LOCAL_POINTERS
+	// Save all int registers that could have an index in them.
+	// They may be pointers, but if they are they are dead.
+	MOVL	AX, 8(SP)
+	MOVL	CX, 12(SP)
+	MOVL	DX, 16(SP)
+	MOVL	BX, 20(SP)
+	// skip SP @ 24(SP)
+	MOVL	BP, 28(SP)
+	MOVL	SI, 32(SP)
+	MOVL	DI, 36(SP)
 
-// Extended versions for 64-bit indexes.
-TEXT runtime·panicExtendIndex(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendIndex(SB)
-TEXT runtime·panicExtendIndexU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendIndexU(SB)
-TEXT runtime·panicExtendSliceAlen(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceAlen(SB)
-TEXT runtime·panicExtendSliceAlenU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceAlenU(SB)
-TEXT runtime·panicExtendSliceAcap(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceAcap(SB)
-TEXT runtime·panicExtendSliceAcapU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceAcapU(SB)
-TEXT runtime·panicExtendSliceB(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceB(SB)
-TEXT runtime·panicExtendSliceBU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendSliceBU(SB)
-TEXT runtime·panicExtendSlice3Alen(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	DX, lo+4(FP)
-	MOVL	BX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3Alen(SB)
-TEXT runtime·panicExtendSlice3AlenU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	DX, lo+4(FP)
-	MOVL	BX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3AlenU(SB)
-TEXT runtime·panicExtendSlice3Acap(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	DX, lo+4(FP)
-	MOVL	BX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3Acap(SB)
-TEXT runtime·panicExtendSlice3AcapU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	DX, lo+4(FP)
-	MOVL	BX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3AcapU(SB)
-TEXT runtime·panicExtendSlice3B(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3B(SB)
-TEXT runtime·panicExtendSlice3BU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	CX, lo+4(FP)
-	MOVL	DX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3BU(SB)
-TEXT runtime·panicExtendSlice3C(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3C(SB)
-TEXT runtime·panicExtendSlice3CU(SB),NOSPLIT,$0-12
-	MOVL	SI, hi+0(FP)
-	MOVL	AX, lo+4(FP)
-	MOVL	CX, y+8(FP)
-	JMP	runtime·goPanicExtendSlice3CU(SB)
+	MOVL	SP, AX		// hide SP read from vet
+	MOVL	40(AX), AX	// PC immediately after call to panicBounds
+	MOVL	AX, 0(SP)
+	LEAL	8(SP), AX
+	MOVL	AX, 4(SP)
+	CALL	runtime·panicBounds32<ABIInternal>(SB)
+	RET
+
+TEXT runtime·panicExtend<ABIInternal>(SB),NOSPLIT,$40-0
+	NO_LOCAL_POINTERS
+	// Save all int registers that could have an index in them.
+	// They may be pointers, but if they are they are dead.
+	MOVL	AX, 8(SP)
+	MOVL	CX, 12(SP)
+	MOVL	DX, 16(SP)
+	MOVL	BX, 20(SP)
+	// skip SP @ 24(SP)
+	MOVL	BP, 28(SP)
+	MOVL	SI, 32(SP)
+	MOVL	DI, 36(SP)
+
+	MOVL	SP, AX		// hide SP read from vet
+	MOVL	40(AX), AX	// PC immediately after call to panicExtend
+	MOVL	AX, 0(SP)
+	LEAL	8(SP), AX
+	MOVL	AX, 4(SP)
+	CALL	runtime·panicBounds32X<ABIInternal>(SB)
+	RET
 
 #ifdef GOOS_android
 // Use the free TLS_SLOT_APP slot #2 on Android Q.

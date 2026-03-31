@@ -54,7 +54,7 @@ func rename(oldname, newname string) error {
 
 // file is the real representation of *File.
 // The extra level of indirection ensures that no clients of os
-// can overwrite this data, which could cause the cleanup
+// can overwrite this data, which could cause the finalizer
 // to close the wrong file descriptor.
 type file struct {
 	pfd         poll.FD
@@ -63,7 +63,7 @@ type file struct {
 	nonblock    bool                    // whether we set nonblocking mode
 	stdoutOrErr bool                    // whether this is stdout or stderr
 	appendMode  bool                    // whether file is opened for appending
-	cleanup     runtime.Cleanup         // cleanup closes the file when no longer referenced
+	inRoot      bool                    // whether file is opened in a Root
 }
 
 // fd is the Unix implementation of Fd.
@@ -222,8 +222,7 @@ func newFile(fd int, name string, kind newFileKind, nonBlocking bool) *File {
 		}
 	}
 
-	// Close the file when the File is not live.
-	f.cleanup = runtime.AddCleanup(f, func(f *file) { f.close() }, f.file)
+	runtime.SetFinalizer(f.file, (*file).close)
 	return f
 }
 
@@ -320,9 +319,8 @@ func (file *file) close() error {
 		err = &PathError{Op: "close", Path: file.name, Err: e}
 	}
 
-	// There is no need for a cleanup at this point. File must be alive at the point
-	// where cleanup.stop is called.
-	file.cleanup.Stop()
+	// no need for a finalizer anymore
+	runtime.SetFinalizer(file, nil)
 	return err
 }
 
@@ -461,24 +459,27 @@ func (d *unixDirent) Info() (FileInfo, error) {
 	if d.info != nil {
 		return d.info, nil
 	}
-	return lstat(d.parent + "/" + d.name)
+	return Lstat(d.parent + "/" + d.name)
 }
 
 func (d *unixDirent) String() string {
 	return fs.FormatDirEntry(d)
 }
 
-func newUnixDirent(parent, name string, typ FileMode) (DirEntry, error) {
+func newUnixDirent(parent *File, name string, typ FileMode) (DirEntry, error) {
 	ude := &unixDirent{
-		parent: parent,
+		parent: parent.name,
 		name:   name,
 		typ:    typ,
 	}
-	if typ != ^FileMode(0) {
+	// When the parent file was opened in a Root,
+	// we cannot use a lazy lstat to load the FileInfo.
+	// Use lstatat here.
+	if typ != ^FileMode(0) && !parent.inRoot {
 		return ude, nil
 	}
 
-	info, err := lstat(parent + "/" + name)
+	info, err := parent.lstatat(name)
 	if err != nil {
 		return nil, err
 	}

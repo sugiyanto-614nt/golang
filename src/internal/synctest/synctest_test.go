@@ -5,6 +5,7 @@
 package synctest_test
 
 import (
+	"context"
 	"fmt"
 	"internal/synctest"
 	"internal/testenv"
@@ -329,6 +330,31 @@ func TestAfterFuncRunsImmediately(t *testing.T) {
 	})
 }
 
+// TestTimerResetZeroDoNotHang verifies that using timer.Reset(0) does not
+// cause the test to hang indefinitely. See https://go.dev/issue/76052.
+func TestTimerResetZeroDoNotHang(t *testing.T) {
+	synctest.Run(func() {
+		timer := time.NewTimer(0)
+		ctx, cancel := context.WithCancel(context.Background())
+
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-timer.C:
+				}
+			}
+		}()
+
+		synctest.Wait()
+		timer.Reset(0)
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+	})
+}
+
 func TestChannelFromOutsideBubble(t *testing.T) {
 	choutside := make(chan struct{})
 	for _, test := range []struct {
@@ -383,57 +409,59 @@ func TestChannelMovedOutOfBubble(t *testing.T) {
 	for _, test := range []struct {
 		desc      string
 		f         func(chan struct{})
-		wantPanic string
+		wantFatal string
 	}{{
 		desc: "receive",
 		f: func(ch chan struct{}) {
 			<-ch
 		},
-		wantPanic: "receive on synctest channel from outside bubble",
+		wantFatal: "receive on synctest channel from outside bubble",
 	}, {
 		desc: "send",
 		f: func(ch chan struct{}) {
 			ch <- struct{}{}
 		},
-		wantPanic: "send on synctest channel from outside bubble",
+		wantFatal: "send on synctest channel from outside bubble",
 	}, {
 		desc: "close",
 		f: func(ch chan struct{}) {
 			close(ch)
 		},
-		wantPanic: "close of synctest channel from outside bubble",
+		wantFatal: "close of synctest channel from outside bubble",
 	}} {
 		t.Run(test.desc, func(t *testing.T) {
 			// Bubbled channel accessed from outside any bubble.
 			t.Run("outside_bubble", func(t *testing.T) {
-				donec := make(chan struct{})
-				ch := make(chan chan struct{})
-				go func() {
-					defer close(donec)
-					defer wantPanic(t, test.wantPanic)
-					test.f(<-ch)
-				}()
-				synctest.Run(func() {
-					ch <- make(chan struct{})
+				wantFatal(t, test.wantFatal, func() {
+					donec := make(chan struct{})
+					ch := make(chan chan struct{})
+					go func() {
+						defer close(donec)
+						test.f(<-ch)
+					}()
+					synctest.Run(func() {
+						ch <- make(chan struct{})
+					})
+					<-donec
 				})
-				<-donec
 			})
 			// Bubbled channel accessed from a different bubble.
 			t.Run("different_bubble", func(t *testing.T) {
-				donec := make(chan struct{})
-				ch := make(chan chan struct{})
-				go func() {
-					defer close(donec)
-					c := <-ch
+				wantFatal(t, test.wantFatal, func() {
+					donec := make(chan struct{})
+					ch := make(chan chan struct{})
+					go func() {
+						defer close(donec)
+						c := <-ch
+						synctest.Run(func() {
+							test.f(c)
+						})
+					}()
 					synctest.Run(func() {
-						defer wantPanic(t, test.wantPanic)
-						test.f(c)
+						ch <- make(chan struct{})
 					})
-				}()
-				synctest.Run(func() {
-					ch <- make(chan struct{})
+					<-donec
 				})
-				<-donec
 			})
 		})
 	}
@@ -443,39 +471,40 @@ func TestTimerFromInsideBubble(t *testing.T) {
 	for _, test := range []struct {
 		desc      string
 		f         func(tm *time.Timer)
-		wantPanic string
+		wantFatal string
 	}{{
 		desc: "read channel",
 		f: func(tm *time.Timer) {
 			<-tm.C
 		},
-		wantPanic: "receive on synctest channel from outside bubble",
+		wantFatal: "receive on synctest channel from outside bubble",
 	}, {
 		desc: "Reset",
 		f: func(tm *time.Timer) {
 			tm.Reset(1 * time.Second)
 		},
-		wantPanic: "reset of synctest timer from outside bubble",
+		wantFatal: "reset of synctest timer from outside bubble",
 	}, {
 		desc: "Stop",
 		f: func(tm *time.Timer) {
 			tm.Stop()
 		},
-		wantPanic: "stop of synctest timer from outside bubble",
+		wantFatal: "stop of synctest timer from outside bubble",
 	}} {
 		t.Run(test.desc, func(t *testing.T) {
-			donec := make(chan struct{})
-			ch := make(chan *time.Timer)
-			go func() {
-				defer close(donec)
-				defer wantPanic(t, test.wantPanic)
-				test.f(<-ch)
-			}()
-			synctest.Run(func() {
-				tm := time.NewTimer(1 * time.Second)
-				ch <- tm
+			wantFatal(t, test.wantFatal, func() {
+				donec := make(chan struct{})
+				ch := make(chan *time.Timer)
+				go func() {
+					defer close(donec)
+					test.f(<-ch)
+				}()
+				synctest.Run(func() {
+					tm := time.NewTimer(1 * time.Second)
+					ch <- tm
+				})
+				<-donec
 			})
-			<-donec
 		})
 	}
 }
@@ -488,7 +517,7 @@ func TestDeadlockRoot(t *testing.T) {
 }
 
 func TestDeadlockChild(t *testing.T) {
-	defer wantPanic(t, "deadlock: all goroutines in bubble are blocked")
+	defer wantPanic(t, "deadlock: main bubble goroutine has exited but blocked goroutines remain")
 	synctest.Run(func() {
 		go func() {
 			select {}
@@ -497,7 +526,7 @@ func TestDeadlockChild(t *testing.T) {
 }
 
 func TestDeadlockTicker(t *testing.T) {
-	defer wantPanic(t, "deadlock: all goroutines in bubble are blocked")
+	defer wantPanic(t, "deadlock: main bubble goroutine has exited but blocked goroutines remain")
 	synctest.Run(func() {
 		go func() {
 			for range time.Tick(1 * time.Second) {
@@ -654,6 +683,17 @@ func TestWaitGroupInBubble(t *testing.T) {
 	})
 }
 
+// https://go.dev/issue/74386
+func TestWaitGroupRacingAdds(t *testing.T) {
+	synctest.Run(func() {
+		var wg sync.WaitGroup
+		for range 100 {
+			wg.Go(func() {})
+		}
+		wg.Wait()
+	})
+}
+
 func TestWaitGroupOutOfBubble(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -705,30 +745,86 @@ func TestWaitGroupMovedBetweenBubblesWithNonZeroCount(t *testing.T) {
 	})
 }
 
-func TestWaitGroupMovedBetweenBubblesWithZeroCount(t *testing.T) {
+func TestWaitGroupDisassociateInWait(t *testing.T) {
 	var wg sync.WaitGroup
 	synctest.Run(func() {
 		wg.Add(1)
 		wg.Done()
+		// Count and waiters are 0, so Wait disassociates the WaitGroup.
+		wg.Wait()
 	})
 	synctest.Run(func() {
-		// Reusing the WaitGroup is safe, because its count is zero.
+		// Reusing the WaitGroup is safe, because it is no longer bubbled.
 		wg.Add(1)
 		wg.Done()
 	})
 }
 
-func TestWaitGroupMovedBetweenBubblesAfterWait(t *testing.T) {
+func TestWaitGroupDisassociateInAdd(t *testing.T) {
 	var wg sync.WaitGroup
 	synctest.Run(func() {
-		wg.Go(func() {})
-		wg.Wait()
+		wg.Add(1)
+		go wg.Wait()
+		synctest.Wait() // wait for Wait to block
+		// Count is 0 and waiters != 0, so Done wakes the waiters and
+		// disassociates the WaitGroup.
+		wg.Done()
 	})
 	synctest.Run(func() {
-		// Reusing the WaitGroup is safe, because its count is zero.
-		wg.Go(func() {})
-		wg.Wait()
+		// Reusing the WaitGroup is safe, because it is no longer bubbled.
+		wg.Add(1)
+		wg.Done()
 	})
+}
+
+var testWaitGroupLinkerAllocatedWG sync.WaitGroup
+
+func TestWaitGroupLinkerAllocated(t *testing.T) {
+	synctest.Run(func() {
+		// This WaitGroup is probably linker-allocated and has no span,
+		// so we won't be able to add a special to it associating it with
+		// this bubble.
+		//
+		// Operations on it may not be durably blocking,
+		// but they shouldn't fail.
+		testWaitGroupLinkerAllocatedWG.Go(func() {})
+		testWaitGroupLinkerAllocatedWG.Wait()
+	})
+}
+
+var testWaitGroupHeapAllocatedWG = new(sync.WaitGroup)
+
+func TestWaitGroupHeapAllocated(t *testing.T) {
+	synctest.Run(func() {
+		// This package-scoped WaitGroup var should have been heap-allocated,
+		// so we can associate it with a bubble.
+		testWaitGroupHeapAllocatedWG.Add(1)
+		go testWaitGroupHeapAllocatedWG.Wait()
+		synctest.Wait()
+		testWaitGroupHeapAllocatedWG.Done()
+	})
+}
+
+// Issue #75134: Many racing bubble associations.
+func TestWaitGroupManyBubbles(t *testing.T) {
+	var wg sync.WaitGroup
+	for range 100 {
+		wg.Go(func() {
+			synctest.Run(func() {
+				cancelc := make(chan struct{})
+				var wg2 sync.WaitGroup
+				for range 100 {
+					wg2.Go(func() {
+						<-cancelc
+					})
+				}
+				synctest.Wait()
+				close(cancelc)
+				wg2.Wait()
+			})
+		})
+	}
+	wg.Wait()
 }
 
 func TestHappensBefore(t *testing.T) {

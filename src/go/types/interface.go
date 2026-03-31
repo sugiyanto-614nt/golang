@@ -176,27 +176,25 @@ func (check *Checker) interfaceType(ityp *Interface, iface *ast.InterfaceType, d
 		name := f.Names[0]
 		if name.Name == "_" {
 			check.error(name, BlankIfaceMethod, "methods must have a unique non-blank name")
-			continue // ignore method
+			continue // ignore
 		}
 
-		// Type-check method declaration.
-		// Note: Don't call check.typ(f.Type) as that would record
-		// the method incorrectly as a type expression in Info.Types.
-		ftyp, _ := f.Type.(*ast.FuncType)
-		if ftyp == nil {
-			check.errorf(f.Type, InvalidSyntaxTree, "%s is not a method signature", f.Type)
-			continue // ignore method
+		typ := check.typ(f.Type)
+		sig, _ := typ.(*Signature)
+		if sig == nil {
+			if isValid(typ) {
+				check.errorf(f.Type, InvalidSyntaxTree, "%s is not a method signature", typ)
+			}
+			continue // ignore
 		}
-		sig := new(Signature)
-		check.funcType(sig, nil, ftyp)
 
-		// The go/parser doesn't accept method type parameters but an ast.FuncType may have them.
+		// The go/parser doesn't accept interface method type parameters but an ast.FuncType may have them.
 		if sig.tparams != nil {
 			var at positioner = f.Type
 			if ftyp, _ := f.Type.(*ast.FuncType); ftyp != nil && ftyp.TypeParams != nil {
 				at = ftyp.TypeParams
 			}
-			check.error(at, InvalidSyntaxTree, "methods cannot have type parameters")
+			check.error(at, InvalidSyntaxTree, "interface methods cannot have type parameters")
 		}
 
 		// use named receiver type if available (for better error messages)

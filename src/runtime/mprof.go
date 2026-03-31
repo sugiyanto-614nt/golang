@@ -146,16 +146,13 @@ type memRecord struct {
 
 // memRecordCycle
 type memRecordCycle struct {
-	allocs, frees           uintptr
-	alloc_bytes, free_bytes uintptr
+	allocs, frees uintptr
 }
 
 // add accumulates b into a. It does not zero b.
 func (a *memRecordCycle) add(b *memRecordCycle) {
 	a.allocs += b.allocs
 	a.frees += b.frees
-	a.alloc_bytes += b.alloc_bytes
-	a.free_bytes += b.free_bytes
 }
 
 // A blockRecord is the bucket data for a bucket of type blockProfile,
@@ -444,7 +441,7 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr) {
 	}
 	// Only use the part of mp.profStack we need and ignore the extra space
 	// reserved for delayed inline expansion with frame pointer unwinding.
-	nstk := callers(5, mp.profStack[:debug.profstackdepth])
+	nstk := callers(3, mp.profStack[:debug.profstackdepth+2])
 	index := (mProfCycle.read() + 2) % uint32(len(memRecord{}.future))
 
 	b := stkbucket(memProfile, size, mp.profStack[:nstk], true)
@@ -453,7 +450,6 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr) {
 
 	lock(&profMemFutureLock[index])
 	mpc.allocs++
-	mpc.alloc_bytes += size
 	unlock(&profMemFutureLock[index])
 
 	// Setprofilebucket locks a bunch of other mutexes, so we call it outside of
@@ -466,7 +462,7 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr) {
 }
 
 // Called when freeing a profiled block.
-func mProf_Free(b *bucket, size uintptr) {
+func mProf_Free(b *bucket) {
 	index := (mProfCycle.read() + 1) % uint32(len(memRecord{}.future))
 
 	mp := b.mp()
@@ -474,7 +470,6 @@ func mProf_Free(b *bucket, size uintptr) {
 
 	lock(&profMemFutureLock[index])
 	mpc.frees++
-	mpc.free_bytes += size
 	unlock(&profMemFutureLock[index])
 }
 
@@ -696,8 +691,8 @@ func (prof *mLockProfile) recordUnlock(cycles int64) {
 		if cycles == 0 {
 			return
 		}
-		prevScore := uint64(cheaprand64()) % uint64(prev)
-		thisScore := uint64(cheaprand64()) % uint64(cycles)
+		prevScore := cheaprandu64() % uint64(prev)
+		thisScore := cheaprandu64() % uint64(cycles)
 		if prevScore > thisScore {
 			prof.cyclesLost += cycles
 			return
@@ -731,8 +726,6 @@ func (prof *mLockProfile) captureStack() {
 	}
 	prof.haveStack = true
 
-	prof.stack[0] = logicalStackSentinel
-
 	var nstk int
 	gp := getg()
 	sp := sys.GetCallerSP()
@@ -740,7 +733,7 @@ func (prof *mLockProfile) captureStack() {
 	systemstack(func() {
 		var u unwinder
 		u.initAt(pc, sp, 0, gp, unwindSilentErrors|unwindJumpStack)
-		nstk = 1 + tracebackPCs(&u, skip, prof.stack[1:])
+		nstk = tracebackPCs(&u, skip, prof.stack)
 	})
 	if nstk < len(prof.stack) {
 		prof.stack[nstk] = 0
@@ -782,7 +775,6 @@ func (prof *mLockProfile) storeSlow() {
 	saveBlockEventStack(cycles, rate, prof.stack[:nstk], mutexProfile)
 	if lost > 0 {
 		lostStk := [...]uintptr{
-			logicalStackSentinel,
 			abi.FuncPCABIInternal(_LostContendedRuntimeLock) + sys.PCQuantum,
 		}
 		saveBlockEventStack(lost, rate, lostStk[:], mutexProfile)
@@ -834,7 +826,6 @@ func SetMutexProfileFraction(rate int) int {
 	return int(old)
 }
 
-//go:linkname mutexevent sync.event
 func mutexevent(cycles int64, skip int) {
 	if cycles < 0 {
 		cycles = 0
@@ -964,7 +955,7 @@ func memProfileInternal(size int, inuseZero bool, copyFn func(profilerecord.MemP
 	head := (*bucket)(mbuckets.Load())
 	for b := head; b != nil; b = b.allnext {
 		mp := b.mp()
-		if inuseZero || mp.active.alloc_bytes != mp.active.free_bytes {
+		if inuseZero || mp.active.allocs != mp.active.frees {
 			n++
 		}
 		if mp.active.allocs != 0 || mp.active.frees != 0 {
@@ -985,7 +976,7 @@ func memProfileInternal(size int, inuseZero bool, copyFn func(profilerecord.MemP
 				mp.future[c] = memRecordCycle{}
 				unlock(&profMemFutureLock[c])
 			}
-			if inuseZero || mp.active.alloc_bytes != mp.active.free_bytes {
+			if inuseZero || mp.active.allocs != mp.active.frees {
 				n++
 			}
 		}
@@ -994,10 +985,9 @@ func memProfileInternal(size int, inuseZero bool, copyFn func(profilerecord.MemP
 		ok = true
 		for b := head; b != nil; b = b.allnext {
 			mp := b.mp()
-			if inuseZero || mp.active.alloc_bytes != mp.active.free_bytes {
+			if inuseZero || mp.active.allocs != mp.active.frees {
 				r := profilerecord.MemProfileRecord{
-					AllocBytes:   int64(mp.active.alloc_bytes),
-					FreeBytes:    int64(mp.active.free_bytes),
+					ObjectSize:   int64(b.size),
 					AllocObjects: int64(mp.active.allocs),
 					FreeObjects:  int64(mp.active.frees),
 					Stack:        b.stk(),
@@ -1011,8 +1001,8 @@ func memProfileInternal(size int, inuseZero bool, copyFn func(profilerecord.MemP
 }
 
 func copyMemProfileRecord(dst *MemProfileRecord, src profilerecord.MemProfileRecord) {
-	dst.AllocBytes = src.AllocBytes
-	dst.FreeBytes = src.FreeBytes
+	dst.AllocBytes = src.AllocObjects * src.ObjectSize
+	dst.FreeBytes = src.FreeObjects * src.ObjectSize
 	dst.AllocObjects = src.AllocObjects
 	dst.FreeObjects = src.FreeObjects
 	if raceenabled {
@@ -1259,6 +1249,20 @@ func goroutineProfileWithLabels(p []profilerecord.StackRecord, labels []unsafe.P
 	return goroutineProfileWithLabelsConcurrent(p, labels)
 }
 
+//go:linkname pprof_goroutineLeakProfileWithLabels
+func pprof_goroutineLeakProfileWithLabels(p []profilerecord.StackRecord, labels []unsafe.Pointer) (n int, ok bool) {
+	return goroutineLeakProfileWithLabels(p, labels)
+}
+
+// labels may be nil. If labels is non-nil, it must have the same length as p.
+func goroutineLeakProfileWithLabels(p []profilerecord.StackRecord, labels []unsafe.Pointer) (n int, ok bool) {
+	if labels != nil && len(labels) != len(p) {
+		labels = nil
+	}
+
+	return goroutineLeakProfileWithLabelsConcurrent(p, labels)
+}
+
 var goroutineProfile = struct {
 	sema    uint32
 	active  bool
@@ -1302,13 +1306,50 @@ func (p *goroutineProfileStateHolder) CompareAndSwap(old, new goroutineProfileSt
 	return (*atomic.Uint32)(p).CompareAndSwap(uint32(old), uint32(new))
 }
 
+func goroutineLeakProfileWithLabelsConcurrent(p []profilerecord.StackRecord, labels []unsafe.Pointer) (n int, ok bool) {
+	if len(p) == 0 {
+		// An empty slice is obviously too small. Return a rough
+		// allocation estimate.
+		return work.goroutineLeak.count, false
+	}
+
+	pcbuf := makeProfStack() // see saveg() for explanation
+
+	// Prepare a profile large enough to store all leaked goroutines.
+	n = work.goroutineLeak.count
+
+	if n > len(p) {
+		// There's not enough space in p to store the whole profile, so
+		// we're not allowed to write to p at all and must return n, false.
+		return n, false
+	}
+
+	// Visit each leaked goroutine and try to record its stack.
+	var offset int
+	forEachGRace(func(gp1 *g) {
+		if readgstatus(gp1)&^_Gscan == _Gleaked {
+			systemstack(func() { saveg(^uintptr(0), ^uintptr(0), gp1, &p[offset], pcbuf) })
+			if labels != nil {
+				labels[offset] = gp1.labels
+			}
+			offset++
+		}
+	})
+
+	if raceenabled {
+		raceacquire(unsafe.Pointer(&labelSync))
+	}
+
+	return n, true
+}
+
 func goroutineProfileWithLabelsConcurrent(p []profilerecord.StackRecord, labels []unsafe.Pointer) (n int, ok bool) {
 	if len(p) == 0 {
 		// An empty slice is obviously too small. Return a rough
 		// allocation estimate without bothering to STW. As long as
 		// this is close, then we'll only need to STW once (on the next
 		// call).
-		return int(gcount()), false
+		return int(gcount(false)), false
 	}
 
 	semacquire(&goroutineProfile.sema)
@@ -1324,7 +1365,7 @@ func goroutineProfileWithLabelsConcurrent(p []profilerecord.StackRecord, labels 
 	// goroutines that can vary between user and system to ensure that the count
 	// doesn't change during the collection. So, check the finalizer goroutine
 	// and cleanup goroutines in particular.
-	n = int(gcount())
+	n = int(gcount(false))
 	if fingStatus.Load()&fingRunningFinalizer != 0 {
 		n++
 	}
@@ -1398,7 +1439,7 @@ func goroutineProfileWithLabelsConcurrent(p []profilerecord.StackRecord, labels 
 		// were collecting the profile. But probably better to return a
 		// truncated profile than to crash the whole process.
 		//
-		// For instance, needm moves a goroutine out of the _Gdead state and so
+		// For instance, needm moves a goroutine out of the _Gdeadextra state and so
 		// might be able to change the goroutine count without interacting with
 		// the scheduler. For code like that, the race windows are small and the
 		// combination of features is uncommon, so it's hard to be (and remain)
@@ -1424,15 +1465,11 @@ func tryRecordGoroutineProfileWB(gp1 *g) {
 // in the current goroutine profile: either that it should not be profiled, or
 // that a snapshot of its call stack and labels are now in the profile.
 func tryRecordGoroutineProfile(gp1 *g, pcbuf []uintptr, yield func()) {
-	if readgstatus(gp1) == _Gdead {
+	if status := readgstatus(gp1); status == _Gdead || status == _Gdeadextra {
 		// Dead goroutines should not appear in the profile. Goroutines that
 		// start while profile collection is active will get goroutineProfiled
 		// set to goroutineProfileSatisfied before transitioning out of _Gdead,
 		// so here we check _Gdead first.
-		return
-	}
-	if isSystemGoroutine(gp1, false) {
-		// System goroutines should not appear in the profile.
 		return
 	}
 
@@ -1472,7 +1509,29 @@ func tryRecordGoroutineProfile(gp1 *g, pcbuf []uintptr, yield func()) {
 // stack), or from the scheduler in preparation to execute gp1 (running on the
 // system stack).
 func doRecordGoroutineProfile(gp1 *g, pcbuf []uintptr) {
-	if readgstatus(gp1) == _Grunning {
+	if isSystemGoroutine(gp1, false) {
+		// System goroutines should not appear in the profile.
+		// Check this here and not in tryRecordGoroutineProfile because isSystemGoroutine
+		// may change on a goroutine while it is executing, so while the scheduler might
+		// see a system goroutine, goroutineProfileWithLabelsConcurrent might not, and
+		// this inconsistency could cause invariants to be violated, such as trying to
+		// record the stack of a running goroutine below. In short, we still want system
+		// goroutines to participate in the same state machine on gp1.goroutineProfiled as
+		// everything else, we just don't record the stack in the profile.
+		return
+	}
+	// Double-check that we didn't make a grave mistake. If the G is running then in
+	// general, we cannot safely read its stack.
+	//
+	// However, there is one case where it's OK. There's a small window of time in
+	// exitsyscall where a goroutine could be in _Grunning as it's exiting a syscall.
+	// This is OK because goroutine will not exit the syscall until it passes through
+	// a call to tryRecordGoroutineProfile. (An explicit one on the fast path, an
+	// implicit one via the scheduler on the slow path.)
+	//
+	// This is also why it's safe to check syscallsp here. The syscall path mutates
+	// syscallsp only after passing through tryRecordGoroutineProfile.
+	if readgstatus(gp1) == _Grunning && gp1.syscallsp == 0 {
 		print("doRecordGoroutineProfile gp1=", gp1.goid, "\n")
 		throw("cannot read stack of running goroutine")
 	}
@@ -1507,7 +1566,16 @@ func goroutineProfileWithLabelsSync(p []profilerecord.StackRecord, labels []unsa
 	isOK := func(gp1 *g) bool {
 		// Checking isSystemGoroutine here makes GoroutineProfile
 		// consistent with both NumGoroutine and Stack.
-		return gp1 != gp && readgstatus(gp1) != _Gdead && !isSystemGoroutine(gp1, false)
+		if gp1 == gp {
+			return false
+		}
+		if status := readgstatus(gp1); status == _Gdead || status == _Gdeadextra {
+			return false
+		}
+		if isSystemGoroutine(gp1, false) {
+			return false
+		}
+		return true
 	}
 
 	pcbuf := makeProfStack() // see saveg() for explanation

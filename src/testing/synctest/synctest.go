@@ -7,6 +7,14 @@
 // The [Test] function runs a function in an isolated "bubble".
 // Any goroutines started within the bubble are also part of the bubble.
 //
+// Each test should be entirely self-contained:
+// The following guidelines should apply to most tests:
+//
+//   - Avoid interacting with goroutines not started from within the test.
+//   - Avoid using the network. Use a fake network implementation as needed.
+//   - Avoid interacting with external processes.
+//   - Avoid leaking goroutines in background tasks.
+//
 // # Time
 //
 // Within a bubble, the [time] package uses a fake clock.
@@ -22,7 +30,7 @@
 //
 //	func TestTime(t *testing.T) {
 //		synctest.Test(t, func(t *testing.T) {
-//			start := time.Now() // always midnight UTC 2001-01-01
+//			start := time.Now() // always midnight UTC 2000-01-01
 //			go func() {
 //				time.Sleep(1 * time.Second)
 //				t.Log(time.Since(start)) // always logs "1s"
@@ -93,6 +101,11 @@
 // A [sync.WaitGroup] becomes associated with a bubble on the first
 // call to Add or Go. Once a WaitGroup is associated with a bubble,
 // calling Add or Go from outside that bubble is a fatal error.
+// (As a technical limitation, a WaitGroup defined as a package
+// variable, such as "var wg sync.WaitGroup", cannot be associated
+// with a bubble and operations on it may not be durably blocking.
+// This limitation does not apply to a *WaitGroup stored in a
+// package variable, such as "var wg = new(sync.WaitGroup)".)
 //
 // [sync.Cond.Wait] is durably blocking. Waking a goroutine in a bubble
 // blocked on Cond.Wait from outside the bubble is a fatal error.
@@ -134,7 +147,7 @@
 //			cancel()
 //			synctest.Wait()
 //			if !afterFuncCalled {
-//				t.Fatalf("before context is canceled: AfterFunc not called")
+//				t.Fatalf("after context is canceled: AfterFunc not called")
 //			}
 //		})
 //	}
@@ -255,6 +268,7 @@ package synctest
 import (
 	"internal/synctest"
 	"testing"
+	"time"
 	_ "unsafe" // for linkname
 )
 
@@ -295,4 +309,24 @@ func testingSynctestTest(t *testing.T, f func(*testing.T)) bool
 // in the same bubble.
 func Wait() {
 	synctest.Wait()
+}
+
+// Sleep blocks until the current bubble's clock has advanced
+// by the duration of d and every goroutine within the current bubble,
+// other than the current goroutine, is durably blocked.
+//
+// This is exactly equivalent to
+//
+//	time.Sleep(d)
+//	synctest.Wait()
+//
+// In tests, this is often preferable to calling only [time.Sleep].
+// If the test itself and another goroutine running the system under test
+// sleeps for the exact same amount of time, it's unpredictable which
+// of the two goroutines will run first. The test itself usually wants
+// to wait for the system under test to "settle" after sleeping.
+// This is what Sleep accomplishes.
+func Sleep(d time.Duration) {
+	time.Sleep(d)
+	Wait()
 }

@@ -238,6 +238,7 @@ func unminit() {
 // resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
 //
 // This always runs without a P, so //go:nowritebarrierrec is required.
+//
 //go:nowritebarrierrec
 func mdestroy(mp *m) {
 }
@@ -642,4 +643,14 @@ const sigPerThreadSyscall = 1 << 31
 //go:nosplit
 func runPerThreadSyscall() {
 	throw("runPerThreadSyscall only valid on linux")
+}
+
+//go:nowritebarrierrec
+//go:nosplit
+func libpreinit() {}
+
+//go:nowritebarrierrec
+//go:nosplit
+func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
+	throw("bad newosproc0")
 }

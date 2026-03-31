@@ -21,7 +21,7 @@ import (
 
 func TestTime(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		start := time.Now() // always midnight UTC 2001-01-01
+		start := time.Now() // always midnight UTC 2000-01-01
 		go func() {
 			time.Sleep(1 * time.Nanosecond)
 			t.Log(time.Since(start)) // always logs "1ns"
@@ -66,7 +66,7 @@ func TestContextAfterFunc(t *testing.T) {
 		cancel()
 		synctest.Wait()
 		if !afterFuncCalled {
-			t.Fatalf("before context is canceled: AfterFunc not called")
+			t.Fatalf("after context is canceled: AfterFunc not called")
 		}
 	})
 }

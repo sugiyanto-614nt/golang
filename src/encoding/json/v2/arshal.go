@@ -11,8 +11,6 @@ import (
 	"encoding"
 	"io"
 	"reflect"
-	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -52,11 +50,13 @@ var export = jsontext.Internal.Export(&internal.AllowInternalUse)
 //
 //   - If any type-specific functions in a [WithMarshalers] option match
 //     the value type, then those functions are called to encode the value.
-//     If all applicable functions return [SkipFunc],
+//     If all applicable functions return [errors.ErrUnsupported],
 //     then the value is encoded according to subsequent rules.
 //
 //   - If the value type implements [MarshalerTo],
 //     then the MarshalJSONTo method is called to encode the value.
+//     If the method returns [errors.ErrUnsupported],
+//     then the input is encoded according to subsequent rules.
 //
 //   - If the value type implements [Marshaler],
 //     then the MarshalJSON method is called to encode the value.
@@ -147,17 +147,23 @@ var export = jsontext.Internal.Export(&internal.AllowInternalUse)
 //     If the format matches one of the format constants declared
 //     in the time package (e.g., RFC1123), then that format is used.
 //     If the format is "unix", "unixmilli", "unixmicro", or "unixnano",
-//     then the timestamp is encoded as a JSON number of the number of seconds
-//     (or milliseconds, microseconds, or nanoseconds) since the Unix epoch,
-//     which is January 1st, 1970 at 00:00:00 UTC.
+//     then the timestamp is encoded as a possibly fractional JSON number
+//     of the number of seconds (or milliseconds, microseconds, or nanoseconds)
+//     since the Unix epoch, which is January 1st, 1970 at 00:00:00 UTC.
+//     To avoid a fractional component, round the timestamp to the relevant unit.
 //     Otherwise, the format is used as-is with [time.Time.Format] if non-empty.
 //
-//   - A Go [time.Duration] is encoded as a JSON string containing the duration
-//     formatted according to [time.Duration.String].
+//   - A Go [time.Duration] currently has no default representation and
+//     requires an explicit format to be specified.
 //     If the format is "sec", "milli", "micro", or "nano",
-//     then the duration is encoded as a JSON number of the number of seconds
-//     (or milliseconds, microseconds, or nanoseconds) in the duration.
-//     If the format is "units", it uses [time.Duration.String].
+//     then the duration is encoded as a possibly fractional JSON number
+//     of the number of seconds (or milliseconds, microseconds, or nanoseconds).
+//     To avoid a fractional component, round the duration to the relevant unit.
+//     If the format is "units", it is encoded as a JSON string formatted using
+//     [time.Duration.String] (e.g., "1h30m" for 1 hour 30 minutes).
+//     If the format is "iso8601", it is encoded as a JSON string using the
+//     ISO 8601 standard for durations (e.g., "PT1H30M" for 1 hour 30 minutes)
+//     using only accurate units of hours, minutes, and seconds.
 //
 //   - All other Go types (e.g., complex numbers, channels, and functions)
 //     have no default representation and result in a [SemanticError].
@@ -261,11 +267,13 @@ func marshalEncode(out *jsontext.Encoder, in any, mo *jsonopts.Struct) (err erro
 //
 //   - If any type-specific functions in a [WithUnmarshalers] option match
 //     the value type, then those functions are called to decode the JSON
-//     value. If all applicable functions return [SkipFunc],
+//     value. If all applicable functions return [errors.ErrUnsupported],
 //     then the input is decoded according to subsequent rules.
 //
 //   - If the value type implements [UnmarshalerFrom],
 //     then the UnmarshalJSONFrom method is called to decode the JSON value.
+//     If the method returns [errors.ErrUnsupported],
+//     then the input is decoded according to subsequent rules.
 //
 //   - If the value type implements [Unmarshaler],
 //     then the UnmarshalJSON method is called to decode the JSON value.
@@ -375,17 +383,21 @@ func marshalEncode(out *jsontext.Encoder, in any, mo *jsonopts.Struct) (err erro
 //     If the format matches one of the format constants declared in
 //     the time package (e.g., RFC1123), then that format is used for parsing.
 //     If the format is "unix", "unixmilli", "unixmicro", or "unixnano",
-//     then the timestamp is decoded from a JSON number of the number of seconds
-//     (or milliseconds, microseconds, or nanoseconds) since the Unix epoch,
-//     which is January 1st, 1970 at 00:00:00 UTC.
+//     then the timestamp is decoded from an optionally fractional JSON number
+//     of the number of seconds (or milliseconds, microseconds, or nanoseconds)
+//     since the Unix epoch, which is January 1st, 1970 at 00:00:00 UTC.
 //     Otherwise, the format is used as-is with [time.Time.Parse] if non-empty.
 //
-//   - A Go [time.Duration] is decoded from a JSON string by
-//     passing the decoded string to [time.ParseDuration].
+//   - A Go [time.Duration] currently has no default representation and
+//     requires an explicit format to be specified.
 //     If the format is "sec", "milli", "micro", or "nano",
-//     then the duration is decoded from a JSON number of the number of seconds
-//     (or milliseconds, microseconds, or nanoseconds) in the duration.
-//     If the format is "units", it uses [time.ParseDuration].
+//     then the duration is decoded from an optionally fractional JSON number
+//     of the number of seconds (or milliseconds, microseconds, or nanoseconds).
+//     If the format is "units", it is decoded from a JSON string parsed using
+//     [time.ParseDuration] (e.g., "1h30m" for 1 hour 30 minutes).
+//     If the format is "iso8601", it is decoded from a JSON string using the
+//     ISO 8601 standard for durations (e.g., "PT1H30M" for 1 hour 30 minutes)
+//     accepting only accurate units of hours, minutes, or seconds.
 //
 //   - All other Go types (e.g., complex numbers, channels, and functions)
 //     have no default representation and result in a [SemanticError].
@@ -399,7 +411,7 @@ func Unmarshal(in []byte, out any, opts ...Options) (err error) {
 	dec := export.GetBufferedDecoder(in, opts...)
 	defer export.PutBufferedDecoder(dec)
 	xd := export.Decoder(dec)
-	err = unmarshalFull(dec, out, &xd.Struct)
+	err = unmarshalDecode(dec, out, &xd.Struct, true)
 	if err != nil && xd.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
 		return internal.TransformUnmarshalError(out, err)
 	}
@@ -416,22 +428,11 @@ func UnmarshalRead(in io.Reader, out any, opts ...Options) (err error) {
 	dec := export.GetStreamingDecoder(in, opts...)
 	defer export.PutStreamingDecoder(dec)
 	xd := export.Decoder(dec)
-	err = unmarshalFull(dec, out, &xd.Struct)
+	err = unmarshalDecode(dec, out, &xd.Struct, true)
 	if err != nil && xd.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
 		return internal.TransformUnmarshalError(out, err)
 	}
 	return err
-}
-
-func unmarshalFull(in *jsontext.Decoder, out any, uo *jsonopts.Struct) error {
-	switch err := unmarshalDecode(in, out, uo); err {
-	case nil:
-		return export.Decoder(in).CheckEOF()
-	case io.EOF:
-		return io.ErrUnexpectedEOF
-	default:
-		return err
-	}
 }
 
 // UnmarshalDecode deserializes a Go value from a [jsontext.Decoder] according to
@@ -441,8 +442,9 @@ func unmarshalFull(in *jsontext.Decoder, out any, uo *jsonopts.Struct) error {
 // Unlike [Unmarshal] and [UnmarshalRead], decode options are ignored because
 // they must have already been specified on the provided [jsontext.Decoder].
 //
-// The input may be a stream of one or more JSON values,
+// The input may be a stream of zero or more JSON values,
 // where this only unmarshals the next JSON value in the stream.
+// If there are no more top-level JSON values, it reports [io.EOF].
 // The output must be a non-nil pointer.
 // See [Unmarshal] for details about the conversion of JSON into a Go value.
 func UnmarshalDecode(in *jsontext.Decoder, out any, opts ...Options) (err error) {
@@ -452,14 +454,14 @@ func UnmarshalDecode(in *jsontext.Decoder, out any, opts ...Options) (err error)
 		defer func() { xd.Struct = optsOriginal }()
 		xd.Struct.JoinWithoutCoderOptions(opts...)
 	}
-	err = unmarshalDecode(in, out, &xd.Struct)
+	err = unmarshalDecode(in, out, &xd.Struct, false)
 	if err != nil && xd.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
 		return internal.TransformUnmarshalError(out, err)
 	}
 	return err
 }
 
-func unmarshalDecode(in *jsontext.Decoder, out any, uo *jsonopts.Struct) (err error) {
+func unmarshalDecode(in *jsontext.Decoder, out any, uo *jsonopts.Struct, last bool) (err error) {
 	v := reflect.ValueOf(out)
 	if v.Kind() != reflect.Pointer || v.IsNil() {
 		return &SemanticError{action: "unmarshal", GoType: reflect.TypeOf(out), Err: internal.ErrNonNilReference}
@@ -470,7 +472,11 @@ func unmarshalDecode(in *jsontext.Decoder, out any, uo *jsonopts.Struct) (err er
 	// In legacy semantics, the entirety of the next JSON value
 	// was validated before attempting to unmarshal it.
 	if uo.Flags.Get(jsonflags.ReportErrorsWithLegacySemantics) {
-		if err := export.Decoder(in).CheckNextValue(); err != nil {
+		if err := export.Decoder(in).CheckNextValue(last); err != nil {
+			if err == io.EOF && last {
+				offset := in.InputOffset() + int64(len(in.UnreadBuffer()))
+				return &jsontext.SyntacticError{ByteOffset: offset, Err: io.ErrUnexpectedEOF}
+			}
 			return err
 		}
 	}
@@ -484,7 +490,14 @@ func unmarshalDecode(in *jsontext.Decoder, out any, uo *jsonopts.Struct) (err er
 		if !uo.Flags.Get(jsonflags.AllowDuplicateNames) {
 			export.Decoder(in).Tokens.InvalidateDisabledNamespaces()
 		}
+		if err == io.EOF && last {
+			offset := in.InputOffset() + int64(len(in.UnreadBuffer()))
+			return &jsontext.SyntacticError{ByteOffset: offset, Err: io.ErrUnexpectedEOF}
+		}
 		return err
+	}
+	if last {
+		return export.Decoder(in).CheckEOF()
 	}
 	return nil
 }
@@ -562,9 +575,6 @@ func putStrings(s *stringSlice) {
 	if cap(*s) > 1<<10 {
 		*s = nil // avoid pinning arbitrarily large amounts of memory
 	}
+	clear(*s) // avoid pinning a reference to each string
 	stringsPools.Put(s)
-}
-
-func (ss *stringSlice) Sort() {
-	slices.SortFunc(*ss, func(x, y string) int { return strings.Compare(x, y) })
 }

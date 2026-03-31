@@ -14,7 +14,6 @@ import (
 	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"cmd/internal/obj/wasm"
-	"internal/buildcfg"
 )
 
 /*
@@ -217,7 +216,7 @@ func ssaGenBlock(s *ssagen.State, b, next *ssa.Block) {
 
 func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 	switch v.Op {
-	case ssa.OpWasmLoweredStaticCall, ssa.OpWasmLoweredClosureCall, ssa.OpWasmLoweredInterCall, ssa.OpWasmLoweredTailCall:
+	case ssa.OpWasmLoweredStaticCall, ssa.OpWasmLoweredClosureCall, ssa.OpWasmLoweredInterCall, ssa.OpWasmLoweredTailCall, ssa.OpWasmLoweredTailCallInter:
 		s.PrepareCall(v)
 		if call, ok := v.Aux.(*ssa.AuxCall); ok && call.Fn == ir.Syms.Deferreturn {
 			// The runtime needs to inject jumps to
@@ -244,6 +243,9 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 			p := s.Prog(obj.ACALL)
 			p.To = obj.Addr{Type: obj.TYPE_NONE}
 			p.Pos = v.Pos
+			if v.Op == ssa.OpWasmLoweredTailCallInter {
+				p.As = obj.ARET
+			}
 		}
 
 	case ssa.OpWasmLoweredMove:
@@ -425,27 +427,11 @@ func ssaGenValueOnStack(s *ssagen.State, v *ssa.Value, extend bool) {
 
 	case ssa.OpWasmI64TruncSatF32S, ssa.OpWasmI64TruncSatF64S:
 		getValue64(s, v.Args[0])
-		if buildcfg.GOWASM.SatConv {
-			s.Prog(v.Op.Asm())
-		} else {
-			if v.Op == ssa.OpWasmI64TruncSatF32S {
-				s.Prog(wasm.AF64PromoteF32)
-			}
-			p := s.Prog(wasm.ACall)
-			p.To = obj.Addr{Type: obj.TYPE_MEM, Name: obj.NAME_EXTERN, Sym: ir.Syms.WasmTruncS}
-		}
+		s.Prog(v.Op.Asm())
 
 	case ssa.OpWasmI64TruncSatF32U, ssa.OpWasmI64TruncSatF64U:
 		getValue64(s, v.Args[0])
-		if buildcfg.GOWASM.SatConv {
-			s.Prog(v.Op.Asm())
-		} else {
-			if v.Op == ssa.OpWasmI64TruncSatF32U {
-				s.Prog(wasm.AF64PromoteF32)
-			}
-			p := s.Prog(wasm.ACall)
-			p.To = obj.Addr{Type: obj.TYPE_MEM, Name: obj.NAME_EXTERN, Sym: ir.Syms.WasmTruncU}
-		}
+		s.Prog(v.Op.Asm())
 
 	case ssa.OpWasmF32DemoteF64:
 		getValue64(s, v.Args[0])

@@ -52,7 +52,7 @@ func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
 	totalDelta := 0
 	wasRunning := true
 	switch oldval {
-	case _Gdead:
+	case _Gdead, _Gdeadextra:
 		wasRunning = false
 		totalDelta++
 	case _Gwaiting:
@@ -62,7 +62,7 @@ func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
 	}
 	isRunning := true
 	switch newval {
-	case _Gdead:
+	case _Gdead, _Gdeadextra:
 		isRunning = false
 		totalDelta--
 		if gp == bubble.main {
@@ -86,7 +86,7 @@ func (bubble *synctestBubble) changegstatus(gp *g, oldval, newval uint32) {
 			bubble.running++
 		} else {
 			bubble.running--
-			if raceenabled && newval != _Gdead {
+			if raceenabled && newval != _Gdead && newval != _Gdeadextra {
 				// Record that this goroutine parking happens before
 				// any subsequent Wait.
 				racereleasemergeg(gp, bubble.raceaddr())
@@ -242,7 +242,13 @@ func synctestRun(f func()) {
 		raceacquireg(gp, gp.bubble.raceaddr())
 	}
 	if total != 1 {
-		panic(synctestDeadlockError{bubble})
+		var reason string
+		if bubble.done {
+			reason = "deadlock: main bubble goroutine has exited but blocked goroutines remain"
+		} else {
+			reason = "deadlock: all goroutines in bubble are blocked"
+		}
+		panic(synctestDeadlockError{reason: reason, bubble: bubble})
 	}
 	if gp.timer != nil && gp.timer.isFake {
 		// Verify that we haven't marked this goroutine's sleep timer as fake.
@@ -252,11 +258,12 @@ func synctestRun(f func()) {
 }
 
 type synctestDeadlockError struct {
+	reason string
 	bubble *synctestBubble
 }
 
-func (synctestDeadlockError) Error() string {
-	return "deadlock: all goroutines in bubble are blocked"
+func (e synctestDeadlockError) Error() string {
+	return e.reason
 }
 
 func synctestidle_c(gp *g, _ unsafe.Pointer) bool {
@@ -356,6 +363,13 @@ type specialBubble struct {
 	bubbleid uint64
 }
 
+// Keep these in sync with internal/synctest.
+const (
+	bubbleAssocUnbubbled     = iota // not associated with any bubble
+	bubbleAssocCurrentBubble        // associated with the current bubble
+	bubbleAssocOtherBubble          // associated with a different bubble
+)
+
 // getOrSetBubbleSpecial checks the special record for p's bubble membership.
 //
 // If add is true and p is not associated with any bubble,
@@ -364,10 +378,12 @@ type specialBubble struct {
 // It returns ok==true if p is associated with bubbleid
 // (including if a new association was added),
 // and ok==false if not.
-func getOrSetBubbleSpecial(p unsafe.Pointer, bubbleid uint64, add bool) (ok bool) {
+func getOrSetBubbleSpecial(p unsafe.Pointer, bubbleid uint64, add bool) (assoc int) {
 	span := spanOfHeap(uintptr(p))
 	if span == nil {
-		throw("getOrSetBubbleSpecial on invalid pointer")
+		// This is probably a package var.
+		// We can't attach a special to it, so always consider it unbubbled.
+		return bubbleAssocUnbubbled
 	}
 
 	// Ensure that the span is swept.
@@ -386,34 +402,40 @@ func getOrSetBubbleSpecial(p unsafe.Pointer, bubbleid uint64, add bool) (ok bool
 		// p is already associated with a bubble.
 		// Return true iff it's the same bubble.
 		s := (*specialBubble)((unsafe.Pointer)(*iter))
-		ok = s.bubbleid == bubbleid
+		if s.bubbleid == bubbleid {
+			assoc = bubbleAssocCurrentBubble
+		} else {
+			assoc = bubbleAssocOtherBubble
+		}
 	} else if add {
 		// p is not associated with a bubble,
 		// and we've been asked to add an association.
+		lock(&mheap_.speciallock)
 		s := (*specialBubble)(mheap_.specialBubbleAlloc.alloc())
+		unlock(&mheap_.speciallock)
 		s.bubbleid = bubbleid
 		s.special.kind = _KindSpecialBubble
 		s.special.offset = offset
 		s.special.next = *iter
 		*iter = (*special)(unsafe.Pointer(s))
 		spanHasSpecials(span)
-		ok = true
+		assoc = bubbleAssocCurrentBubble
 	} else {
 		// p is not associated with a bubble.
-		ok = false
+		assoc = bubbleAssocUnbubbled
 	}
 
 	unlock(&span.speciallock)
 	releasem(mp)
 
-	return ok
+	return assoc
 }
 
 // synctest_associate associates p with the current bubble.
 // It returns false if p is already associated with a different bubble.
 //
 //go:linkname synctest_associate internal/synctest.associate
-func synctest_associate(p unsafe.Pointer) (ok bool) {
+func synctest_associate(p unsafe.Pointer) int {
 	return getOrSetBubbleSpecial(p, getg().bubble.id, true)
 }
 
@@ -428,5 +450,5 @@ func synctest_disassociate(p unsafe.Pointer) {
 //
 //go:linkname synctest_isAssociated internal/synctest.isAssociated
 func synctest_isAssociated(p unsafe.Pointer) bool {
-	return getOrSetBubbleSpecial(p, getg().bubble.id, false)
+	return getOrSetBubbleSpecial(p, getg().bubble.id, false) == bubbleAssocCurrentBubble
 }

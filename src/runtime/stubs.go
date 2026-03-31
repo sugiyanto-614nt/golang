@@ -274,7 +274,16 @@ func reflectcall(stackArgsType *_type, fn, stackArgs unsafe.Pointer, stackArgsSi
 // See go.dev/issue/67401.
 //
 //go:linkname procyield
-func procyield(cycles uint32)
+//go:nosplit
+func procyield(cycles uint32) {
+	if cycles == 0 {
+		return
+	}
+	procyieldAsm(cycles)
+}
+
+// procyieldAsm is the assembly implementation of procyield.
+func procyieldAsm(cycles uint32)
 
 type neverCallThisFunction struct{}
 
@@ -325,6 +334,7 @@ func morestack()
 func morestack_noctxt()
 
 func rt0_go()
+func rt0_lib_go()
 
 // in asm_*.s
 // not called directly; definitions here supply type information for traceback.

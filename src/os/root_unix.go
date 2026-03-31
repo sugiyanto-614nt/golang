@@ -56,7 +56,7 @@ func newRoot(fd int, name string) (*Root, error) {
 		fd:   fd,
 		name: name,
 	}}
-	r.root.cleanup = runtime.AddCleanup(r, func(f *root) { f.Close() }, r.root)
+	runtime.SetFinalizer(r.root, (*root).Close)
 	return r, nil
 }
 
@@ -75,7 +75,7 @@ func openRootInRoot(r *Root, name string) (*Root, error) {
 	if err != nil {
 		return nil, &PathError{Op: "openat", Path: name, Err: err}
 	}
-	return newRoot(fd, name)
+	return newRoot(fd, joinPath(r.Name(), name))
 }
 
 // rootOpenFileNolog is Root.OpenFile.
@@ -83,8 +83,18 @@ func rootOpenFileNolog(root *Root, name string, flag int, perm FileMode) (*File,
 	fd, err := doInRoot(root, name, nil, func(parent int, name string) (fd int, err error) {
 		ignoringEINTR(func() error {
 			fd, err = unix.Openat(parent, name, syscall.O_NOFOLLOW|syscall.O_CLOEXEC|flag, uint32(perm))
-			if isNoFollowErr(err) || err == syscall.ENOTDIR {
-				err = checkSymlink(parent, name, err)
+			if err != nil {
+				// Never follow symlinks when O_CREATE|O_EXCL, no matter
+				// what error the OS returns.
+				isCreateExcl := flag&(O_CREATE|O_EXCL) == (O_CREATE | O_EXCL)
+				if !isCreateExcl && (isNoFollowErr(err) || err == syscall.ENOTDIR) {
+					err = checkSymlink(parent, name, err)
+				}
+				// AIX returns ELOOP instead of EEXIST for a dangling symlink.
+				// Convert this to EEXIST so it matches ErrExists.
+				if isCreateExcl && err == syscall.ELOOP {
+					err = syscall.EEXIST
+				}
 			}
 			return err
 		})
@@ -94,6 +104,7 @@ func rootOpenFileNolog(root *Root, name string, flag int, perm FileMode) (*File,
 		return nil, &PathError{Op: "openat", Path: name, Err: err}
 	}
 	f := newFile(fd, joinPath(root.Name(), name), kindOpenFile, unix.HasNonblockFlag(flag))
+	f.inRoot = true
 	return f, nil
 }
 

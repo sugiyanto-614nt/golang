@@ -60,7 +60,9 @@ func pedanticReadAll(r io.Reader) (b []byte, err error) {
 	}
 }
 
-func TestClient(t *testing.T) { run(t, testClient) }
+func TestClient(t *testing.T) {
+	run(t, testClient, []testMode{http1Mode, https1Mode, http2UnencryptedMode, http2Mode})
+}
 func testClient(t *testing.T, mode testMode) {
 	ts := newClientServerTest(t, mode, robotsTxtHandler).ts
 
@@ -438,7 +440,6 @@ func testRedirectsByMethod(t *testing.T, mode testMode, method string, table []r
 		req, _ := NewRequest(method, ts.URL+tt.suffix, strings.NewReader(content))
 		req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(content)), nil }
 		res, err := c.Do(req)
-
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -584,6 +585,36 @@ var echoCookiesRedirectHandler = HandlerFunc(func(w ResponseWriter, r *Request) 
 		w.Write([]byte("hello"))
 	}
 })
+
+func TestHostMismatchCookies(t *testing.T) { run(t, testHostMismatchCookies) }
+func testHostMismatchCookies(t *testing.T, mode testMode) {
+	ts := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		for _, c := range r.Cookies() {
+			c.Value = "SetOnServer"
+			SetCookie(w, c)
+		}
+	})).ts
+
+	reqURL, _ := url.Parse(ts.URL)
+	hostURL := *reqURL
+	hostURL.Host = "cookies.example.com"
+
+	c := ts.Client()
+	c.Jar = new(TestJar)
+	c.Jar.SetCookies(reqURL, []*Cookie{{Name: "First", Value: "SetOnClient"}})
+	c.Jar.SetCookies(&hostURL, []*Cookie{{Name: "Second", Value: "SetOnClient"}})
+
+	req, _ := NewRequest("GET", ts.URL, NoBody)
+	req.Host = hostURL.Host
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	resp.Body.Close()
+
+	matchReturnedCookies(t, []*Cookie{{Name: "First", Value: "SetOnClient"}}, c.Jar.Cookies(reqURL))
+	matchReturnedCookies(t, []*Cookie{{Name: "Second", Value: "SetOnServer"}}, c.Jar.Cookies(&hostURL))
+}
 
 func TestClientSendsCookieFromJar(t *testing.T) {
 	defer afterTest(t)
@@ -1227,7 +1258,7 @@ func testClientTimeout(t *testing.T, mode testMode) {
 				t.Logf("timeout before response received")
 				continue
 			}
-			if runtime.GOOS == "windows" && strings.HasPrefix(runtime.GOARCH, "arm") {
+			if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
 				testenv.SkipFlaky(t, 43120)
 			}
 			t.Fatal(err)
@@ -1256,7 +1287,7 @@ func testClientTimeout(t *testing.T, mode testMode) {
 			t.Errorf("ReadAll error = %q; expected some context.DeadlineExceeded", err)
 		}
 		if got := ne.Error(); !strings.Contains(got, "(Client.Timeout") {
-			if runtime.GOOS == "windows" && strings.HasPrefix(runtime.GOARCH, "arm") {
+			if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
 				testenv.SkipFlaky(t, 43120)
 			}
 			t.Errorf("error string = %q; missing timeout substring", got)
@@ -1302,7 +1333,7 @@ func testClientTimeout_Headers(t *testing.T, mode testMode) {
 		t.Errorf("ReadAll error = %q; expected some context.DeadlineExceeded", err)
 	}
 	if got := ne.Error(); !strings.Contains(got, "Client.Timeout exceeded") {
-		if runtime.GOOS == "windows" && strings.HasPrefix(runtime.GOARCH, "arm") {
+		if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
 			testenv.SkipFlaky(t, 43120)
 		}
 		t.Errorf("error string = %q; missing timeout substring", got)
@@ -1589,6 +1620,39 @@ func testClientStripHeadersOnRepeatedRedirect(t *testing.T, mode testMode) {
 	if res.Header.Get("X-Done") != "true" {
 		t.Fatalf("response missing expected header: X-Done=true")
 	}
+}
+
+func TestClientStripHeadersOnPostToGetRedirect(t *testing.T) {
+	run(t, testClientStripHeadersOnPostToGetRedirect)
+}
+func testClientStripHeadersOnPostToGetRedirect(t *testing.T, mode testMode) {
+	ts := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
+		if r.Method == "POST" {
+			Redirect(w, r, "/redirected", StatusFound)
+			return
+		} else if r.Method != "GET" {
+			t.Errorf("unexpected request method: %v", r.Method)
+			return
+		}
+		for key, val := range r.Header {
+			if strings.HasPrefix(key, "Content-") {
+				t.Errorf("unexpected request body header after redirect: %v: %v", key, val)
+			}
+		}
+	})).ts
+
+	c := ts.Client()
+
+	req, _ := NewRequest("POST", ts.URL, strings.NewReader("hello world"))
+	req.Header.Set("Content-Encoding", "a")
+	req.Header.Set("Content-Language", "b")
+	req.Header.Set("Content-Length", "c")
+	req.Header.Set("Content-Type", "d")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
 }
 
 // Issue 22233: copy host when Client follows a relative redirect.
@@ -2224,6 +2288,11 @@ func testProbeZeroLengthBody(t *testing.T, mode testMode) {
 		defer wg.Done()
 		req, _ := NewRequest("GET", cst.ts.URL, bodyr)
 		res, err := cst.c.Do(req)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer res.Body.Close()
 		b, err := io.ReadAll(res.Body)
 		if err != nil {
 			t.Error(err)

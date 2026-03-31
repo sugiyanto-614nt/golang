@@ -8,6 +8,7 @@ package sanitizers_test
 
 import (
 	"bytes"
+	"crypto/fips140"
 	"fmt"
 	"internal/platform"
 	"internal/testenv"
@@ -42,10 +43,11 @@ func TestASAN(t *testing.T) {
 		{src: "asan_global3_fail.go", memoryAccessError: "global-buffer-overflow", errorLocation: "asan_global3_fail.go:13"},
 		{src: "asan_global4_fail.go", memoryAccessError: "global-buffer-overflow", errorLocation: "asan_global4_fail.go:21"},
 		{src: "asan_global5.go"},
+		{src: "asan_global_asm"},
+		{src: "asan_global_asm2_fail", memoryAccessError: "global-buffer-overflow", errorLocation: "main.go:17"},
 		{src: "arena_fail.go", memoryAccessError: "use-after-poison", errorLocation: "arena_fail.go:26", experiments: []string{"arenas"}},
 	}
 	for _, tc := range cases {
-		tc := tc
 		name := strings.TrimSuffix(tc.src, ".go")
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -153,6 +155,10 @@ func mustHaveASAN(t *testing.T) *config {
 	}
 	if !platform.ASanSupported(goos, goarch) {
 		t.Skipf("skipping on %s/%s; -asan option is not supported.", goos, goarch)
+	}
+
+	if fips140.Enabled() {
+		t.Skipf("skipping with FIPS 140 mode; -asan option is not supported.")
 	}
 
 	// The current implementation is only compatible with the ASan library from version

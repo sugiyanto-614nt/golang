@@ -83,13 +83,17 @@ func (wg *WaitGroup) Add(delta int) {
 		race.Disable()
 		defer race.Enable()
 	}
+	bubbled := false
 	if synctest.IsInBubble() {
 		// If Add is called from within a bubble, then all Add calls must be made
 		// from the same bubble.
-		if !synctest.Associate(wg) {
+		switch synctest.Associate(wg) {
+		case synctest.Unbubbled:
+		case synctest.OtherBubble:
 			// wg is already associated with a different bubble.
 			fatal("sync: WaitGroup.Add called from multiple synctest bubbles")
-		} else {
+		case synctest.CurrentBubble:
+			bubbled = true
 			state := wg.state.Or(waitGroupBubbleFlag)
 			if state != 0 && state&waitGroupBubbleFlag == 0 {
 				// Add has been called from outside this bubble.
@@ -98,7 +102,7 @@ func (wg *WaitGroup) Add(delta int) {
 		}
 	}
 	state := wg.state.Add(uint64(delta) << 32)
-	if state&waitGroupBubbleFlag != 0 && !synctest.IsInBubble() {
+	if state&waitGroupBubbleFlag != 0 && !bubbled {
 		// Add has been called from within a synctest bubble (and we aren't in one).
 		fatal("sync: WaitGroup.Add called from inside and outside synctest bubble")
 	}
@@ -116,13 +120,6 @@ func (wg *WaitGroup) Add(delta int) {
 	if w != 0 && delta > 0 && v == int32(delta) {
 		panic("sync: WaitGroup misuse: Add called concurrently with Wait")
 	}
-	if v == 0 && state&waitGroupBubbleFlag != 0 {
-		// Disassociate the WaitGroup from its bubble.
-		synctest.Disassociate(wg)
-		if w == 0 {
-			wg.state.Store(0)
-		}
-	}
 	if v > 0 || w == 0 {
 		return
 	}
@@ -136,6 +133,11 @@ func (wg *WaitGroup) Add(delta int) {
 	}
 	// Reset waiters count to 0.
 	wg.state.Store(0)
+	if bubbled {
+		// Adds must not happen concurrently with wait when counter is 0,
+		// so we can safely disassociate wg from its current bubble.
+		synctest.Disassociate(wg)
+	}
 	for ; w != 0; w-- {
 		runtime_Semrelease(&wg.sema, false, 0)
 	}
@@ -162,12 +164,19 @@ func (wg *WaitGroup) Wait() {
 	for {
 		state := wg.state.Load()
 		v := int32(state >> 32)
-		w := uint32(state)
+		w := uint32(state & 0x7fffffff)
 		if v == 0 {
 			// Counter is 0, no need to wait.
 			if race.Enabled {
 				race.Enable()
 				race.Acquire(unsafe.Pointer(wg))
+			}
+			if w == 0 && state&waitGroupBubbleFlag != 0 && synctest.IsAssociated(wg) {
+				// Adds must not happen concurrently with wait when counter is 0,
+				// so we can disassociate wg from its current bubble.
+				if wg.state.CompareAndSwap(state, 0) {
+					synctest.Disassociate(wg)
+				}
 			}
 			return
 		}
@@ -195,12 +204,13 @@ func (wg *WaitGroup) Wait() {
 				}
 			}
 			runtime_SemacquireWaitGroup(&wg.sema, synctestDurable)
-			if wg.state.Load() != 0 {
-				panic("sync: WaitGroup is reused before previous Wait has returned")
-			}
+			isReset := wg.state.Load() != 0
 			if race.Enabled {
 				race.Enable()
 				race.Acquire(unsafe.Pointer(wg))
+			}
+			if isReset {
+				panic("sync: WaitGroup is reused before previous Wait has returned")
 			}
 			return
 		}
@@ -226,7 +236,25 @@ func (wg *WaitGroup) Wait() {
 func (wg *WaitGroup) Go(f func()) {
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer func() {
+			if x := recover(); x != nil {
+				// f panicked, which will be fatal because
+				// this is a new goroutine.
+				//
+				// Calling Done will unblock Wait in the main goroutine,
+				// allowing it to race with the fatal panic and
+				// possibly even exit the process (os.Exit(0))
+				// before the panic completes.
+				//
+				// This is almost certainly undesirable,
+				// so instead avoid calling Done and simply panic.
+				panic(x)
+			}
+
+			// f completed normally, or abruptly using goexit.
+			// Either way, decrement the semaphore.
+			wg.Done()
+		}()
 		f()
 	}()
 }

@@ -60,6 +60,7 @@ func TestRuntimeTypesPresent(t *testing.T) {
 		"internal/abi.ArrayType":     true,
 		"internal/abi.ChanType":      true,
 		"internal/abi.FuncType":      true,
+		"internal/abi.MapType":       true,
 		"internal/abi.PtrType":       true,
 		"internal/abi.SliceType":     true,
 		"internal/abi.StructType":    true,
@@ -70,16 +71,6 @@ func TestRuntimeTypesPresent(t *testing.T) {
 	found := findTypes(t, dwarf, want)
 	if len(found) != len(want) {
 		t.Errorf("found %v, want %v", found, want)
-	}
-
-	// Must have one of OldMapType or SwissMapType.
-	want = map[string]bool{
-		"internal/abi.OldMapType":   true,
-		"internal/abi.SwissMapType": true,
-	}
-	found = findTypes(t, dwarf, want)
-	if len(found) != 1 {
-		t.Errorf("map type want one of %v found %v", want, found)
 	}
 }
 
@@ -417,7 +408,6 @@ func main() {}
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -482,7 +472,6 @@ func main() {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -564,7 +553,6 @@ func main() {
 		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -902,6 +890,10 @@ func main() {
 	var x interface{} = &X{}
 	p := *(*uintptr)(unsafe.Pointer(&x))
 	print(p)
+	f(nil)
+}
+//go:noinline
+func f(x *X) { // Make sure that there is dwarf recorded for *X.
 }
 `
 	dir := t.TempDir()
@@ -1989,7 +1981,6 @@ func TestZeroSizedVariable(t *testing.T) {
 	// See go.dev/issues/54615.
 
 	for _, opt := range []string{NoOpt, DefaultOpt} {
-		opt := opt
 		t.Run(opt, func(t *testing.T) {
 			_, ex := gobuildAndExamine(t, zeroSizedVarProg, opt)
 
